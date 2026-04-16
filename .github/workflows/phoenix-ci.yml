@@ -1,0 +1,67 @@
+name: Phoenix CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-check:
+    name: Rust Check & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config \
+            libseccomp-dev protobuf-compiler libprotobuf-dev libcurl4-openssl-dev \
+            libpq-dev libicu-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cargo check (compute_tools)
+        run: cargo check -p compute_tools
+
+      - name: Cargo check (pageserver)
+        run: cargo check -p pageserver
+
+      - name: Cargo check (wal_decoder)
+        run: cargo check -p wal_decoder
+
+      - name: Clippy (wal_decoder)
+        run: cargo clippy -p wal_decoder -- -D warnings
+        continue-on-error: true
+
+  docs:
+    name: Documentation Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check architecture doc exists
+        run: |
+          test -f docs/ORIOLEDB_SERVERLESS.md
+          test -f docs/PG_PATCHES_INVENTORY.md
+          test -f README.md

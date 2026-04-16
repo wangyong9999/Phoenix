@@ -1,0 +1,44 @@
+/artifact_cache
+/build
+/pg_install
+/target
+/tmp_check
+/tmp_check_cli
+__pycache__/
+test_output/
+neon_previous/
+.vscode
+.idea
+*.swp
+tags
+neon.iml
+/.neon
+/integration_tests/.neon
+compaction-suite-results.*
+docker-compose/docker-compose-parallel.yml
+
+# Coverage
+*.profraw
+*.profdata
+
+*.key
+*.crt
+*.o
+*.so
+*.Po
+*.pid
+
+# pgindent typedef lists
+*.list
+
+# Node
+**/node_modules/
+
+# various files for local testing
+/proxy/.subzero
+local_proxy.json
+
+# Test artifacts
+test_pgdata/
+test_pg.log
+*.bc

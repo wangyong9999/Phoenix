@@ -1,0 +1,303 @@
+/*-------------------------------------------------------------------------
+ *
+ * wal.h
+ * 		WAL declarations for orioledb.
+ *
+ * Copyright (c) 2021-2026, Oriole DB Inc.
+ * Copyright (c) 2025-2026, Supabase Inc.
+ *
+ * IDENTIFICATION
+ *	  contrib/orioledb/include/recovery/wal.h
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef __WAL_H__
+#define __WAL_H__
+
+#include "recovery/wal_reader.h"
+
+/*
+ * WAL record types
+ *
+ * WAL_REC_REINSERT :	UPDATE with changed pkey represented as DELETE + INSERT in OrioleDB but externally exported as an UPDATE in logical decoding
+ *
+ * WAL_REC_SWITCH_LOGICAL_XID :	Record type for a case when both heap and Oriole apply changes within a single transaction, so one logical xid is assigned by heap, and the other is assigned by Oriole.
+ * 								This record defines a connection between Oriole's sub-transaction xid and a xid of the top heap transaction which is needed for logical decoder.
+ *								Otherwise, without this connection, main transaction suddenly becomes splitted into two independent parts.
+ * 								From logical decoder's point of view this looks like two independent transactions but in fact internally related to each other.
+ * 								This situation outcomes in troubles for logical decoder with visibility of heap modifications
+ * 								in Oriole's sub-part due to incorrect state of the MVCC-historical snapshot.
+ */
+
+#define WAL_REC_NONE           (0)
+
+#define ORIOLE_WAL_RECORDS(X) \
+	X(WAL_REC_XID,                   1, "XID",                wal_parse_rec_xid) \
+	X(WAL_REC_COMMIT,                2, "COMMIT",             wal_parse_rec_finish) \
+	X(WAL_REC_ROLLBACK,              3, "ROLLBACK",           wal_parse_rec_finish) \
+	X(WAL_REC_RELATION,              4, "RELATION",           wal_parse_rec_relation) \
+	X(WAL_REC_INSERT,                5, "INSERT",             wal_parse_rec_modify) \
+	X(WAL_REC_UPDATE,                6, "UPDATE",             wal_parse_rec_modify) \
+	X(WAL_REC_DELETE,                7, "DELETE",             wal_parse_rec_modify) \
+	X(WAL_REC_O_TABLES_META_LOCK,    8, "META_LOCK",          NULL) \
+	X(WAL_REC_O_TABLES_META_UNLOCK,  9, "META_UNLOCK",        wal_parse_rec_o_tables_meta_unlock) \
+	X(WAL_REC_SAVEPOINT,            10, "SAVEPOINT",          wal_parse_rec_savepoint) \
+	X(WAL_REC_ROLLBACK_TO_SAVEPOINT,11, "RB_TO_SP",           wal_parse_rec_rollback_to_savepoint) \
+	X(WAL_REC_JOINT_COMMIT,         12, "JOINT_COMMIT",       wal_parse_rec_joint_commit) \
+	X(WAL_REC_TRUNCATE,             13, "TRUNCATE",           wal_parse_rec_truncate) \
+	X(WAL_REC_BRIDGE_ERASE,         14, "BRIDGE_ERASE",       wal_parse_rec_bridge_erase) \
+	X(WAL_REC_REINSERT,             15, "REINSERT",           wal_parse_rec_modify) \
+	X(WAL_REC_REPLAY_FEEDBACK,      16, "REPLAY_FEEDBACK",    NULL) \
+	X(WAL_REC_SWITCH_LOGICAL_XID,   17, "SWITCH_LOGICAL_XID", wal_parse_rec_switch_logical_xid) \
+	X(WAL_REC_RELREPLIDENT,         18, "RELREPLIDENT",       wal_parse_rec_relreplident)
+
+/* Parsers */
+extern WalParseResult wal_parse_rec_xid(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_finish(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_relation(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_o_tables_meta_unlock(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_savepoint(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_rollback_to_savepoint(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_joint_commit(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_truncate(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_bridge_erase(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_switch_logical_xid(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_relreplident(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_rec_modify(WalReaderState *r, WalRecord *rec);
+
+enum OrioleWalRecType
+{
+#define X(sym, val, name, fn) sym = (val),
+	ORIOLE_WAL_RECORDS(X)
+#undef X
+};
+
+/*
+ * Current WAL version of OrioleDB.
+ * Bump it when WAL format changes compared to previous release.
+ * ORIOLEDB_WAL_VERSION makes sense and should be converted even between
+ * different ORIOLEDB_BINARY_VERSION's. This is unlike
+ * ORIOLEDB_SYS_TREE_VERSION, ORIOLEDB_PAGE_VERSION and
+ * ORIOLEDB_COMPRESS_VERSION (see big comment on versioning
+ * in include/orioledb.h)
+ */
+#define ORIOLEDB_WAL_VERSION (17)
+
+/*
+ * Value has been fixed at the moment of introducing WAL versioning.
+ * WAL versions before FIRST_ORIOLEDB_WAL_VERSION are treated as zero
+ * and still supported for on-the fly conversion to the current
+ * ORIOLEDB_WAL_VERSION. (Exact value follows the fact that before
+ * WAL version was introduced in the beginning of the WAL container,
+ * WAL container started from rec_type byte with at most 4 lower bits
+ * occupied. So it's a way to distinguish pre-WAL version container
+ * from the container with WAL version.)
+ *
+ * We should never change this value.
+ */
+#define FIRST_ORIOLEDB_WAL_VERSION (16)
+
+/*
+ * Particular WAL version when per-container flags were added to WAL container.
+ *
+ * We should never change this value.
+ */
+#define ORIOLEDB_CONTAINER_FLAGS_WAL_VERSION (17)
+
+/* Constants for commitInProgressXlogLocation */
+#define OWalTmpCommitPos			(0)
+#define OWalInvalidCommitPos		UINT64_MAX
+
+
+/*
+ * Data structures for transactions in-progress recording.
+ */
+typedef struct
+{
+	uint8		recType;
+} WALRec;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		oxid[sizeof(OXid)];
+	uint8		logicalXid[sizeof(TransactionId)];
+	/* Since ORIOLEDB_WAL_VERSION = 17 */
+	uint8		heapXid[sizeof(TransactionId)];
+} WALRecXid;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		topXid[sizeof(TransactionId)];
+	uint8		subXid[sizeof(TransactionId)];
+} WALRecSwitchLogicalXid;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		treeType;
+	uint8		datoid[sizeof(Oid)];
+	uint8		reloid[sizeof(Oid)];
+	uint8		relnode[sizeof(Oid)];
+	/* Since ORIOLEDB_WAL_VERSION = 17 */
+	uint8		xmin[sizeof(OXid)];
+	uint8		csn[sizeof(CommitSeqNo)];
+	uint8		cid[sizeof(CommandId)];
+	uint8		version[sizeof(uint32)];
+	uint8		baseVersion[sizeof(uint32)];
+} WALRecRelation;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		relreplident;
+	uint8		relreplident_ix_oid[sizeof(Oid)];
+} WALRecRelReplident;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		datoid[sizeof(Oid)];
+	uint8		reloid[sizeof(Oid)];
+	uint8		old_relnode[sizeof(Oid)];
+	uint8		new_relnode[sizeof(Oid)];
+} WALRecOTablesUnlockMeta;
+
+/* Modify record that contains one tuple */
+typedef struct
+{
+	uint8		recType;
+	uint8		tupleFormatFlags;
+	uint8		length[sizeof(OffsetNumber)];
+	/* tuple[length] */
+} WALRecModify1;
+
+/* Modify records that contains 2 tuples, old and new. Needed for REINSERT and for REPLICA IDENTITY FULL */
+typedef struct
+{
+	uint8		recType;
+	uint8		tupleFormatFlags1;
+	uint8		tupleFormatFlags2;
+	uint8		length1[sizeof(OffsetNumber)];
+	uint8		length2[sizeof(OffsetNumber)];
+	/* tuple1[length1] */
+	/* tuple2[length2] */
+} WALRecModify2;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		parentSubid[sizeof(SubTransactionId)];
+	uint8		logicalXid[sizeof(TransactionId)];
+	uint8		parentLogicalXid[sizeof(TransactionId)];
+} WALRecSavepoint;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		parentSubid[sizeof(SubTransactionId)];
+	uint8		xmin[sizeof(OXid)]; /* Since ORIOLEDB_WAL_VERSION = 17 */
+	uint8		csn[sizeof(CommitSeqNo)];	/* Since ORIOLEDB_WAL_VERSION = 17 */
+} WALRecRollbackToSavepoint;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		xid[sizeof(TransactionId)];
+	uint8		xmin[sizeof(OXid)];
+	uint8		csn[sizeof(CommitSeqNo)];
+} WALRecJointCommit;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		xmin[sizeof(OXid)];
+	uint8		csn[sizeof(CommitSeqNo)];
+} WALRecFinish;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		datoid[sizeof(Oid)];
+	uint8		reloid[sizeof(Oid)];
+	uint8		relnode[sizeof(Oid)];
+} WALRecTruncate;
+
+typedef struct
+{
+	uint8		recType;
+	uint8		iptr[sizeof(ItemPointerData)];
+} WALRecBridgeErase;
+
+/*
+ * Following WAL records don't have recType field and they are controlled by
+ * WAL_CONTAINER_HAS_* flags.
+ */
+
+#define ORIOLE_WAL_FLAGS(X) \
+	X(WAL_CONTAINER_HAS_XACT_INFO,		(1U << 0), "XACT_INFO",		wal_parse_container_xact_info) \
+	X(WAL_CONTAINER_HAS_ORIGIN_INFO,	(1U << 1), "HAS_ORIGIN",	wal_parse_container_origin_info)
+
+/* Flag Parsers */
+extern WalParseResult wal_parse_container_xact_info(WalReaderState *r, WalRecord *rec);
+extern WalParseResult wal_parse_container_origin_info(WalReaderState *r, WalRecord *rec);
+
+enum OrioleWalFlagType
+{
+#define X(sym, val, name, fn)	sym = (val),
+	ORIOLE_WAL_FLAGS(X)
+#undef  X
+};
+
+typedef struct
+{
+	uint8		xactTime[sizeof(TimestampTz)];
+	uint8		xid[sizeof(TransactionId)];
+} WALRecXactInfo;
+
+typedef struct
+{
+	uint8		origin_id[sizeof(RepOriginId)];
+	uint8		origin_lsn[sizeof(XLogRecPtr)];
+} WALRecOriginInfo;
+
+
+#define LOCAL_WAL_BUFFER_SIZE	(8192)
+#define ORIOLEDB_WAL_PREFIX	"o_wal"
+#define ORIOLEDB_WAL_PREFIX_SIZE (5)
+
+extern const char *wal_record_type_to_string(int wal_record);
+
+extern void add_rel_wal_record(ORelOids oids, OIndexType type, uint32 version, uint32 base_version);
+
+extern void add_modify_wal_record(uint8 rec_type, BTreeDescr *desc,
+								  OTuple tuple, OffsetNumber length, char relreplident, uint32 version, uint32 base_version);
+extern void add_bridge_erase_wal_record(BTreeDescr *desc, ItemPointer iptr, uint32 version, uint32 base_version);
+extern void add_o_tables_meta_lock_wal_record(void);
+extern void add_o_tables_meta_unlock_wal_record(ORelOids oids, Oid oldRelnode);
+extern void add_switch_logical_xid_wal_record(TransactionId logicalXid_top, TransactionId logicalXid_sub);
+extern void add_savepoint_wal_record(SubTransactionId parentSubid,
+									 TransactionId prentLogicalXid);
+extern void add_rollback_to_savepoint_wal_record(SubTransactionId parentSubid);
+extern bool local_wal_is_empty(void);
+extern XLogRecPtr flush_local_wal(bool isCommit, bool withXactTime);
+extern XLogRecPtr wal_commit(OXid oxid, TransactionId logicalXid,
+							 bool isAutonomous);
+extern XLogRecPtr wal_joint_commit(OXid oxid, TransactionId logicalXid,
+								   TransactionId xid, bool subTransaction);
+extern void wal_after_commit(void);
+extern void wal_rollback(OXid oxid, TransactionId logicalXid,
+						 bool isAutonomous);
+extern XLogRecPtr log_logical_wal_container(Pointer ptr, int length,
+											bool withXactTime);
+extern void o_wal_insert(BTreeDescr *desc, OTuple tuple, char relreplident, uint32 version);
+extern void o_wal_update(BTreeDescr *desc, OTuple tuple, OTuple oldtuple, char relreplident, uint32 version);
+extern void o_wal_delete(BTreeDescr *desc, OTuple tuple, char relreplident, uint32 version);
+extern void o_wal_delete_key(BTreeDescr *desc, OTuple key, bool is_bridge_index, uint32 version);
+extern void o_wal_reinsert(BTreeDescr *desc, OTuple oldtuple, OTuple newtuple, char relreplident, uint32 version);
+extern void add_truncate_wal_record(ORelOids oids);
+extern bool get_local_wal_has_material_changes(void);
+extern void set_local_wal_has_material_changes(bool value);
+
+#endif							/* __WAL_H__ */
