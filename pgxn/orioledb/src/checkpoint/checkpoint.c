@@ -5853,38 +5853,19 @@ checkpointable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 										 &checkpoint_concurrent);
 
 	/*
-	 * Neon deferred control file load: shmem_startup runs in postmaster
-	 * where IsUnderPostmaster=false and Neon smgr is not available.
-	 * Control file couldn't be loaded from PageServer at that time.
-	 * Now we're in a backend (IsUnderPostmaster=true) — retry.
+	 * Neon deferred control file load used to live here. It now runs at
+	 * the top of sys_tree_init_if_needed so that sys_trees_reset_initialized
+	 * fires *before* any metaPageBlkno allocation happens — firing it
+	 * mid-allocation leaves the current tree's header in a permanent
+	 * {initialized=true, metaPageBlkno=invalid} state, which only
+	 * surfaces when the *next* fresh backend (autovacuum launcher or a
+	 * regular user backend) tries to copy from that header into its
+	 * local descriptor. See sys_trees_load_control_if_deferred.
+	 *
+	 * By the time user-tree init reaches here (descr.c callers), sys
+	 * trees have already been accessed for catalog lookup, so the
+	 * control file is already loaded.
 	 */
-	if (chkp_num == 0 && smgr_hook != NULL && IsUnderPostmaster &&
-		checkpoint_state->lastCheckpointNumber == 0)
-	{
-		CheckpointControl control;
-
-		if (get_checkpoint_control_data(&control))
-		{
-			checkpoint_state->lastCheckpointNumber = control.lastCheckpointNumber;
-			checkpoint_state->controlReplayStartPtr = control.replayStartPtr;
-			checkpoint_state->controlSysTreesStartPtr = control.sysTreesStartPtr;
-			checkpoint_state->controlToastConsistentPtr = control.toastConsistentPtr;
-
-			/*
-			 * Reset all system tree initialized flags so they re-init
-			 * with the correct checkpoint number (they were initialized
-			 * in shmem_startup with chkp_num=0 because control file
-			 * wasn't available in postmaster process).
-			 */
-			sys_trees_reset_initialized();
-
-			/* Re-read with updated checkpoint state */
-			chkp_num = get_cur_checkpoint_number(&desc->oids, desc->type,
-												 &checkpoint_concurrent);
-			elog(LOG, "OrioleDB: deferred control file load from PageServer, "
-				 "chkp_num=%u, reset %d sys trees", chkp_num, SYS_TREES_NUM);
-		}
-	}
 
 	map_chkp_num = chkp_num;
 

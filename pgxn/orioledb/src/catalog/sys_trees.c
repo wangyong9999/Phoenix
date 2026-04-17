@@ -21,7 +21,10 @@
 #include "catalog/sys_trees.h"
 #include "catalog/o_sys_cache.h"
 #include "checkpoint/checkpoint.h"
+#include "checkpoint/control.h"
+#include "miscadmin.h"
 #include "recovery/recovery.h"
+#include "storage/smgr.h"
 #include "tableam/descr.h"
 #include "tableam/handler.h"
 #include "transam/undo.h"
@@ -721,6 +724,51 @@ sys_tree_get_extra(int tree_num)
 }
 
 /*
+ * Neon deferred control file load.
+ *
+ * shmem_startup() runs in the postmaster where IsUnderPostmaster=false and
+ * Neon's smgr hook isn't set up yet, so we can't pull the OrioleDB control
+ * file from PageServer there. The first backend to touch a sys tree after
+ * PG reaches "accepting connections" must load it and reset the per-tree
+ * initialized flags so the subsequent alloc loop re-reads map files at the
+ * correct chkp_num.
+ *
+ * This MUST run before sys_tree_init_if_needed's alloc loop starts handing
+ * out metaPageBlkno pages. Previously this was done from inside
+ * checkpointable_tree_init (reached mid-way through sys_tree_init(i, true)),
+ * which produced a subtle race: sys_tree_init had already written the freshly
+ * allocated metaPageBlkno into sysTreesShmemHeaders[i].rootInfo, then
+ * sys_trees_reset_initialized() nuked it, then sys_tree_init_if_needed set
+ * header->initialized = true — leaving the header in a permanent
+ * {initialized=true, metaPageBlkno=invalid} state that crashed the next
+ * fresh backend (autovacuum launcher, first user backend, …) with
+ * `Assert("OInMemoryBlknoIsValid((td)->rootInfo.metaPageBlkno)")`.
+ */
+static void
+sys_trees_load_control_if_deferred(void)
+{
+	CheckpointControl control;
+
+	if (smgr_hook == NULL || !IsUnderPostmaster)
+		return;
+	if (checkpoint_state->lastCheckpointNumber != 0)
+		return;
+	if (!get_checkpoint_control_data(&control))
+		return;
+
+	checkpoint_state->lastCheckpointNumber = control.lastCheckpointNumber;
+	checkpoint_state->controlReplayStartPtr = control.replayStartPtr;
+	checkpoint_state->controlSysTreesStartPtr = control.sysTreesStartPtr;
+	checkpoint_state->controlToastConsistentPtr = control.toastConsistentPtr;
+
+	sys_trees_reset_initialized();
+
+	elog(LOG, "OrioleDB: deferred control file load from PageServer, "
+		 "chkp_num=%u, reset %d sys trees",
+		 control.lastCheckpointNumber, SYS_TREES_NUM);
+}
+
+/*
  * Initializes the system B-tree if it is not already done.
  *
  * We can not initialize it on the shared memory startup because it uses
@@ -733,6 +781,14 @@ sys_tree_init_if_needed(int i)
 
 	if (sysTreesDescrs[i].initialized)
 		return;
+
+	/*
+	 * Pull the control file from PageServer up-front (Neon only; no-op
+	 * everywhere else). See sys_trees_load_control_if_deferred for why
+	 * this has to precede the alloc loop rather than running inside
+	 * checkpointable_tree_init.
+	 */
+	sys_trees_load_control_if_deferred();
 
 	/*
 	 * Try to initialize every system tree (avoid possible problem when
