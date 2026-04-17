@@ -95,3 +95,100 @@ jobs:
           test -f docs/ORIOLEDB_SERVERLESS.md
           test -f docs/PG_PATCHES_INVENTORY.md
           test -f README.md
+
+  serverless-e2e:
+    name: Serverless E2E (Plan E round-trip)
+    runs-on: ubuntu-latest
+    needs: rust-check
+    # Skeleton job: the full stack (PG build + neon binaries + orioledb
+    # extension + E2E run) is heavy and still stabilizing. Keep it
+    # non-blocking for now so merges don't wait on flakes, but surface
+    # failures in the PR check UI.
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Populate Postgres v17 (runtime target)
+        run: |
+          set -e
+          if [ ! -f "vendor/postgres-v17/configure" ]; then
+            rm -rf vendor/postgres-v17
+            git clone --depth 1 --branch REL_17_STABLE_neon \
+              https://github.com/neondatabase/postgres.git vendor/postgres-v17
+          fi
+          # postgres_ffi's build.rs expects all four header sets at
+          # build time (see rust-check job). Populate v14/15/16 too.
+          for v in 14 15 16; do
+            if [ ! -f "vendor/postgres-v${v}/configure" ]; then
+              rm -rf "vendor/postgres-v${v}"
+              git clone --depth 1 --branch "REL_${v}_STABLE_neon" \
+                https://github.com/neondatabase/postgres.git "vendor/postgres-v${v}"
+            fi
+          done
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev pkg-config \
+            libseccomp-dev protobuf-compiler libprotobuf-dev libcurl4-openssl-dev \
+            libicu-dev bison flex libreadline-dev zlib1g-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-
+
+      - name: Cache pg_install
+        id: cache-pg-install
+        uses: actions/cache@v4
+        with:
+          path: pg_install
+          key: ${{ runner.os }}-pg-install-v17-${{ hashFiles('vendor/postgres-v17/configure', 'Makefile', 'pgxn/orioledb/Makefile') }}
+
+      - name: Build Postgres v17 + OrioleDB extension + walproposer-lib
+        run: |
+          # walproposer-lib pulls in neon-pg-ext-v17 → postgres-install-v17
+          # as a dependency chain, so a single target builds the whole
+          # native stack for v17. On a cache hit, postgres-install-v17
+          # is up-to-date and Make no-ops it; neon-pg-ext-v17 still runs
+          # (cheap against cached pg_install), which keeps the extension
+          # .so in lockstep with the current source tree.
+          make POSTGRES_VERSIONS=v17 walproposer-lib
+
+      - name: Build neon binaries (debug)
+        run: |
+          cargo build \
+            --bin neon_local \
+            --bin pageserver \
+            --bin safekeeper \
+            --bin storage_broker \
+            --bin storage_controller \
+            --bin compute_ctl
+
+      - name: Run Plan E serverless round-trip
+        id: e2e
+        run: bash scripts/test_e2e.sh
+        env:
+          ROWS: "100"
+
+      - name: Upload .neon logs on failure
+        if: always() && steps.e2e.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: neon-logs-${{ github.run_id }}
+          path: |
+            .neon/**/*.log
+            .neon/endpoints/*/compute.log
+          if-no-files-found: ignore
+          retention-days: 7
