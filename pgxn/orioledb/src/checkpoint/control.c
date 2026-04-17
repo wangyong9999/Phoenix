@@ -48,15 +48,17 @@ get_checkpoint_control_data(CheckpointControl *control)
 		if (errno == ENOENT)
 		{
 			/*
-			 * Neon Plan E: control file missing locally — try PageServer.
-			 * The FPI was emitted by write_checkpoint_control() with
-			 * fake relation (dbOid=0, relNumber=65500).
-			 */
-			/*
-			 * Plan E control-file fallback. Safe in any process context
-			 * because we use smgrexists / smgrnblocks preflight instead of
-			 * PG_TRY/PG_CATCH, so LWLock bookkeeping stays balanced even if
-			 * the caller (OrioleDB startup) holds locks.
+			 * Neon Plan E fallback: the control file is missing locally.
+			 * Try to fetch the FPI that write_checkpoint_control() emitted
+			 * via XLogRegisterBlock into PageServer, using the synthetic
+			 * relation (dbOid=0, relNumber=65500).
+			 *
+			 * We use smgrexists + smgrnblocks as the preflight instead of
+			 * PG_TRY/PG_CATCH: callers (OrioleDB startup) may hold LWLocks
+			 * and FlushErrorState would corrupt the holdoff/lock bookkeeping.
+			 * If PageServer hasn't recorded a block under this relation yet
+			 * (no prior checkpoint on this branch), smgrexists returns
+			 * false and we treat the control file as absent.
 			 */
 			if (smgr_hook != NULL && IsUnderPostmaster)
 			{
@@ -70,10 +72,6 @@ get_checkpoint_control_data(CheckpointControl *control)
 				reln = smgropen(rlocator, INVALID_PROC_NUMBER,
 								RELPERSISTENCE_PERMANENT);
 
-				/*
-				 * Skip smgrexists/smgrnblocks — synthetic relations have no
-				 * DDL-created metadata in PageServer. Go directly to smgrread.
-				 */
 				if (smgrexists(reln, MAIN_FORKNUM) &&
 					smgrnblocks(reln, MAIN_FORKNUM) > 0)
 				{
