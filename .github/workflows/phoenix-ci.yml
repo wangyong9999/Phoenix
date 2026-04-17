@@ -176,13 +176,17 @@ jobs:
 
       - name: Build neon binaries (debug)
         run: |
+          # endpoint_storage is spawned by `cargo neon start` alongside
+          # pageserver/safekeeper/broker/controller/compute_ctl — missing
+          # it causes "start endpoint_storage: No such file or directory".
           cargo build \
             --bin neon_local \
             --bin pageserver \
             --bin safekeeper \
             --bin storage_broker \
             --bin storage_controller \
-            --bin compute_ctl
+            --bin compute_ctl \
+            --bin endpoint_storage
 
       - name: Run Plan E serverless round-trip
         id: e2e
