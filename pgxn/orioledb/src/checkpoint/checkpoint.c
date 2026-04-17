@@ -5549,11 +5549,29 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 							== sizeof(file_header))
 						{
 							prev_chkp_file_exist = true;
+
+							/*
+							 * Propagate the chkp_num of the rehydrated map
+							 * back to the caller, mirroring the path at
+							 * line 5580 where prev_chkp_file already
+							 * existed. Without this, checkpointable_tree_
+							 * fill_seq_buffers would open seq-buf files
+							 * using the *requested* chkp_num (e.g. 3 after
+							 * an end-of-recovery checkpoint), but we just
+							 * materialised the map at prev_chkp_tag.num
+							 * (e.g. 2, the last checkpoint that actually
+							 * touched this tree) — the mismatch fires
+							 * `PANIC: could not open seq buf file
+							 * {relnode}-3.map for read: No such file or
+							 * directory` on the first fresh backend.
+							 */
+							*map_chkp_num = prev_chkp_tag.num;
+
 							elog(DEBUG1,
 								 "evictable_tree_init_meta: map rehydrated "
-								 "from PageServer (%u,%u) nblocks=%u",
+								 "from PageServer (%u,%u) chkp=%u nblocks=%u",
 								 desc->oids.datoid, desc->oids.relnode,
-								 nblocks);
+								 prev_chkp_tag.num, nblocks);
 						}
 						else if (prev_chkp_file >= 0)
 						{
