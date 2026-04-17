@@ -50,6 +50,7 @@
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecovery.h"
 #include "storage/procnumber.h"
 #include "storage/smgr.h"
 #include "catalog/pg_tablespace_d.h"
@@ -782,7 +783,7 @@ btree_smgr_read(BTreeDescr *desc, char *buffer, uint32 chkpNum,
 	 * Mapping: (datoid, relnode, offset/BLCKSZ) → (dbOid, relNumber, blkno)
 	 */
 	if (neon_io_enabled && !use_mmap && !use_device && !orioledb_s3_mode
-		&& !AmStartupProcess())
+		&& (!AmStartupProcess() || IsOrioleDbRecoveryRequested()))
 	{
 		/*
 		 * Plan E: read OrioleDB B-tree pages from PageServer.
@@ -790,8 +791,17 @@ btree_smgr_read(BTreeDescr *desc, char *buffer, uint32 chkpNum,
 		 * During startup, OrioleDB WAL replay rebuilds B-trees in memory
 		 * and writes to local files; the end-of-recovery checkpoint emits
 		 * fresh FPIs. Normal backends read from PageServer directly.
-		 * AmStartupProcess is excluded because Neon smgr may not be ready
-		 * (walreceiver/LwLsn not yet initialised).
+		 *
+		 * AmStartupProcess is normally excluded because Neon smgr may not
+		 * be ready (walreceiver/LwLsn not yet initialised). But on the
+		 * OrioleDB stateless-restart path (orioledb_recovery.signal),
+		 * compute_ctl has already brought Neon up via basebackup BEFORE
+		 * starting PG, so smgr IS ready throughout the startup process —
+		 * and the post-recovery sys-tree init (checkpointable_tree_init
+		 * reading rootPageBlkno from the data file) MUST be able to reach
+		 * PageServer, because local disk is empty after basebackup. So we
+		 * allow the Neon read path in startup when the OrioleDB recovery
+		 * signal is active.
 		 */
 		RelFileLocator rlocator;
 		SMgrRelation reln;
