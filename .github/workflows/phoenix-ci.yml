@@ -21,6 +21,12 @@ jobs:
 
       - name: Init Postgres submodules (v14-v17)
         run: |
+          set -x
+          # Debug: confirm .gitmodules is present after checkout
+          ls -la .gitmodules || echo "no .gitmodules"
+          cat .gitmodules || true
+          git config --list | grep -E '^submodule\.' || echo "no submodule config"
+          git ls-files --error-unmatch vendor/postgres-v17 || echo "v17 gitlink not indexed"
           # The .gitmodules uses a relative URL `../postgres.git` which resolves
           # to `wangyong9999/postgres` on this fork (doesn't exist). Rewrite
           # each Postgres submodule URL to the upstream neondatabase/postgres
@@ -32,6 +38,8 @@ jobs:
           git submodule init
           git submodule sync
           git submodule update --depth 2 --progress
+          # Verify
+          ls vendor/postgres-v17/configure vendor/postgres-v16/configure vendor/postgres-v15/configure vendor/postgres-v14/configure
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
