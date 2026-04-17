@@ -1624,9 +1624,8 @@ write_page_to_disk(BTreeDescr *desc, FileExtent *extent, uint32 curChkpNum,
 		 * end-of-recovery, and we do not catch errors that would leave
 		 * LWLock state unbalanced.
 		 */
-		extern bool checkpoint_is_shutdown;
 		if (neon_io_enabled && desc->storageType == BTreeStoragePersistence
-			&& XLogInsertAllowed() && !checkpoint_is_shutdown)
+			&& XLogInsertAllowed())
 		{
 			BlockNumber blkno = byte_offset / ORIOLEDB_BLCKSZ;
 			RelFileLocator rlocator;

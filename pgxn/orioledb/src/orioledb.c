@@ -464,7 +464,22 @@ _PG_init(void)
 	 */
 	if (am_wal_redo_postgres)
 	{
-		RegisterCustomRmgr(ORIOLEDB_RMGR_ID, &rmgr);
+		/*
+		 * Light-mode RMGR for wal-redo: only rm_redo is needed.
+		 * Must NOT include rm_startup (o_recovery_start_hook) because
+		 * it accesses shared memory which doesn't exist in wal-redo.
+		 */
+		static RmgrData wal_redo_rmgr = {
+			.rm_name = "OrioleDB resource manager",
+			.rm_startup = NULL,
+			.rm_cleanup = NULL,
+			.rm_redo = orioledb_redo,
+			.rm_desc = NULL,
+			.rm_identify = NULL,
+			.rm_mask = NULL,
+			.rm_decode = NULL
+		};
+		RegisterCustomRmgr(ORIOLEDB_RMGR_ID, &wal_redo_rmgr);
 		elog(LOG, "OrioleDB: wal-redo light mode — RMGR %d registered",
 			 ORIOLEDB_RMGR_ID);
 		return;

@@ -2931,7 +2931,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	 * startup process. Seq-buf readers need the full file — mirroring only
 	 * the header would force a PANIC on stateless restart.
 	 */
-	if (smgr_hook != NULL && XLogInsertAllowed() && !checkpoint_is_shutdown)
+	if (smgr_hook != NULL && XLogInsertAllowed())
 	{
 		RelFileLocator rlocator;
 		char		page[BLCKSZ];

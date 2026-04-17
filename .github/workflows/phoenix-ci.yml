@@ -29,7 +29,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libssl-dev pkg-config \
             libseccomp-dev protobuf-compiler libprotobuf-dev libcurl4-openssl-dev \
-            libpq-dev libicu-dev
+            libpq-dev libicu-dev bison flex libreadline-dev zlib1g-dev
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -40,6 +40,17 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Cache Postgres headers
+        id: cache-pg-headers
+        uses: actions/cache@v4
+        with:
+          path: pg_install
+          key: ${{ runner.os }}-pg-headers-${{ hashFiles('vendor/postgres-v14/configure', 'vendor/postgres-v15/configure', 'vendor/postgres-v16/configure', 'vendor/postgres-v17/configure') }}
+
+      - name: Install Postgres headers (all versions)
+        if: steps.cache-pg-headers.outputs.cache-hit != 'true'
+        run: make postgres-headers-install
 
       - name: Cargo check (compute_tools)
         run: cargo check -p compute_tools

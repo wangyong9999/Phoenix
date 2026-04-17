@@ -213,7 +213,13 @@ orioledb_page_wal_emit_fpi(BTreeDescr *desc, OInMemoryBlkno blkno,
 
 	disk_blkno = orioledb_page_get_blkno(blkno);
 	if (disk_blkno == InvalidBlockNumber)
-		return;					/* no extent yet — will get FPI at checkpoint */
+	{
+		/* Pre-allocate extent so we can emit WAL with a stable blkno */
+		orioledb_page_ensure_extent(desc, blkno);
+		disk_blkno = orioledb_page_get_blkno(blkno);
+		if (disk_blkno == InvalidBlockNumber)
+			return;				/* still no extent — skip */
+	}
 
 	page = O_GET_IN_MEMORY_PAGE(blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
@@ -257,9 +263,11 @@ orioledb_page_wal_leaf_insert(BTreeDescr *desc, OInMemoryBlkno blkno,
 	disk_blkno = orioledb_page_get_blkno(blkno);
 	if (disk_blkno == InvalidBlockNumber)
 	{
-		/* No extent yet — emit FPI instead of delta */
-		orioledb_page_wal_emit_fpi(desc, blkno, ORIOLEDB_XLOG_LEAF_INSERT);
-		return;
+		/* No extent yet — pre-allocate one so we have a stable blkno */
+		orioledb_page_ensure_extent(desc, blkno);
+		disk_blkno = orioledb_page_get_blkno(blkno);
+		if (disk_blkno == InvalidBlockNumber)
+			return;				/* still no extent — skip */
 	}
 
 	page = O_GET_IN_MEMORY_PAGE(blkno);

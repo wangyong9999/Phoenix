@@ -192,9 +192,7 @@ write_checkpoint_control(CheckpointControl *control)
 	 * Uses fake relation (dbOid=0, relNumber=0) so GetPage can
 	 * serve it on restart without local files.
 	 */
-	extern bool checkpoint_is_shutdown;
-	if (smgr_hook != NULL && !RecoveryInProgress() && XLogInsertAllowed()
-		&& !checkpoint_is_shutdown)
+	if (smgr_hook != NULL && !RecoveryInProgress() && XLogInsertAllowed())
 	{
 		RelFileLocator rlocator;
 		char		page[BLCKSZ];
