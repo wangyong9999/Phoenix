@@ -51,7 +51,7 @@ get_checkpoint_control_data(CheckpointControl *control)
 			 * Neon Plan E fallback: the control file is missing locally.
 			 * Try to fetch the FPI that write_checkpoint_control() emitted
 			 * via XLogRegisterBlock into PageServer, using the synthetic
-			 * relation (dbOid=0, relNumber=65500).
+			 * relation (dbOid=0, relNumber=ORIOLEDB_CONTROL_FILE_OID).
 			 *
 			 * We use smgrexists + smgrnblocks as the preflight instead of
 			 * PG_TRY/PG_CATCH: callers (OrioleDB startup) may hold LWLocks
@@ -68,7 +68,7 @@ get_checkpoint_control_data(CheckpointControl *control)
 
 				rlocator.spcOid = DEFAULTTABLESPACE_OID;
 				rlocator.dbOid = 0;
-				rlocator.relNumber = 65500; /* reserved OID for OrioleDB control */
+				rlocator.relNumber = ORIOLEDB_CONTROL_FILE_OID;
 				reln = smgropen(rlocator, INVALID_PROC_NUMBER,
 								RELPERSISTENCE_PERMANENT);
 
@@ -95,12 +95,21 @@ get_checkpoint_control_data(CheckpointControl *control)
 	readBytes = read(controlFile, (Pointer) control, sizeof(CheckpointControl));
 
 	if (readBytes == 0)
+	{
+		close(controlFile);
 		return false;
-	else if (readBytes != sizeof(CheckpointControl))
+	}
+	if (readBytes != sizeof(CheckpointControl))
+	{
+		int			save_errno = errno;
+
+		close(controlFile);
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not read data from control file \"%s\": %m",
 						CONTROL_FILENAME)));
+	}
 
 	close(controlFile);
 	check_checkpoint_control(control);
@@ -197,7 +206,7 @@ write_checkpoint_control(CheckpointControl *control)
 
 		rlocator.spcOid = DEFAULTTABLESPACE_OID;
 		rlocator.dbOid = 0;
-		rlocator.relNumber = 65500; /* reserved OID for OrioleDB control */
+		rlocator.relNumber = ORIOLEDB_CONTROL_FILE_OID;
 
 		/* Pack control data into a standard 8KB page */
 		memset(page, 0, BLCKSZ);

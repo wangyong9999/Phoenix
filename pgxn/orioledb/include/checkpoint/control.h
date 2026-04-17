@@ -64,6 +64,20 @@ typedef struct
 
 #define CONTROL_FILENAME    ORIOLEDB_DATA_DIR"/control"
 
+/*
+ * Synthetic RelFileNumber used to publish the OrioleDB checkpoint control
+ * file to Neon PageServer as a single-block fake relation.
+ *
+ * Chosen in the "user-space" OID range (> FirstNormalObjectId = 16384) but
+ * far below the space any real user would hit in practice. Reserved for
+ * exclusive use by OrioleDB Plan E.
+ */
+#define ORIOLEDB_CONTROL_FILE_OID	65500
+
+StaticAssertDecl(ORIOLEDB_CONTROL_FILE_OID > 16384 &&
+				 ORIOLEDB_CONTROL_FILE_OID < UINT32_MAX - 1,
+				 "ORIOLEDB_CONTROL_FILE_OID must live in the user OID range");
+
 #define GetCheckpointableUndoLog(i) \
 	(AssertMacro((i) >= 0 && (i) < 2), \
 		(i) == 0 ? UndoLogRegular : UndoLogSystem)

@@ -1223,7 +1223,7 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 
 		xlrec.rlocator.spcOid = DEFAULTTABLESPACE_OID;
 		xlrec.rlocator.dbOid = 0;
-		xlrec.rlocator.relNumber = 65500;
+		xlrec.rlocator.relNumber = ORIOLEDB_CONTROL_FILE_OID;
 		xlrec.forkNum = MAIN_FORKNUM;
 		XLogBeginInsert();
 		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
