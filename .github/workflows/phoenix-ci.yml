@@ -22,16 +22,16 @@ jobs:
       - name: Init Postgres submodules (v14-v17)
         run: |
           # The .gitmodules uses a relative URL `../postgres.git` which resolves
-          # to `wangyong9999/postgres` on this fork (doesn't exist). Override
-          # each Postgres submodule to the upstream neondatabase/postgres mirror.
-          # postgres_ffi's build.rs hardcodes the v14..v17 list via a macro, so
-          # all four header sets must be present at build time.
+          # to `wangyong9999/postgres` on this fork (doesn't exist). Rewrite
+          # each Postgres submodule URL to the upstream neondatabase/postgres
+          # mirror before init+update. postgres_ffi's build.rs hardcodes the
+          # v14..v17 list via a macro, so all four header sets must be present.
           for v in v14 v15 v16 v17; do
             git config --file=.gitmodules submodule.vendor/postgres-$v.url https://github.com/neondatabase/postgres.git
           done
+          git submodule init
           git submodule sync
-          git submodule update --init --depth 2 --progress \
-            vendor/postgres-v14 vendor/postgres-v15 vendor/postgres-v16 vendor/postgres-v17
+          git submodule update --depth 2 --progress
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
