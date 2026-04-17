@@ -1623,21 +1623,33 @@ write_page_to_disk(BTreeDescr *desc, FileExtent *extent, uint32 curChkpNum,
 		 * XLogInsert is safe here because XLogInsertAllowed() is true at
 		 * end-of-recovery, and we do not catch errors that would leave
 		 * LWLock state unbalanced.
+		 *
+		 * Skip during shutdown checkpoint: XLogInsertAllowed() can be true
+		 * at the start of the shutdown checkpoint but PG tears down WAL
+		 * insertion while the checkpoint is running, so a late XLogInsert
+		 * here would PANIC ("concurrent write-ahead log activity while
+		 * database system is shutting down"). The prior checkpoint's FPI
+		 * plus SafeKeeper WAL is enough to recover on next startup.
 		 */
-		if (neon_io_enabled && desc->storageType == BTreeStoragePersistence
-			&& XLogInsertAllowed())
 		{
-			BlockNumber blkno = byte_offset / ORIOLEDB_BLCKSZ;
-			RelFileLocator rlocator;
+			extern bool checkpoint_is_shutdown;
 
-			rlocator.spcOid = DEFAULTTABLESPACE_OID;
-			rlocator.dbOid = desc->oids.datoid;
-			rlocator.relNumber = desc->oids.relnode;
+			if (neon_io_enabled
+				&& desc->storageType == BTreeStoragePersistence
+				&& !checkpoint_is_shutdown && XLogInsertAllowed())
+			{
+				BlockNumber blkno = byte_offset / ORIOLEDB_BLCKSZ;
+				RelFileLocator rlocator;
 
-			XLogBeginInsert();
-			XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, blkno,
-							  buf, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-			XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
+				rlocator.spcOid = DEFAULTTABLESPACE_OID;
+				rlocator.dbOid = desc->oids.datoid;
+				rlocator.relNumber = desc->oids.relnode;
+
+				XLogBeginInsert();
+				XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, blkno,
+								  buf, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+				XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
+			}
 		}
 
 		err = btree_smgr_write(desc, buf, chkpNum, write_size, byte_offset) != write_size;
