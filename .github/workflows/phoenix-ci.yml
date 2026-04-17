@@ -156,7 +156,15 @@ jobs:
           path: pg_install
           key: ${{ runner.os }}-pg-install-v17-${{ hashFiles('vendor/postgres-v17/configure', 'Makefile', 'pgxn/orioledb/Makefile') }}
 
-      - name: Build Postgres v17 + OrioleDB extension + walproposer-lib
+      - name: Install Postgres headers (all versions)
+        run: |
+          # postgres_ffi/build.rs iterates v14..v17 via for_all_postgres_versions!
+          # and needs header sets for every version at bindgen time. Install
+          # the cheap headers for all four; the v17 runtime is built in the
+          # next step via walproposer-lib.
+          make postgres-headers-install
+
+      - name: Build Postgres v17 runtime + OrioleDB extension + walproposer-lib
         run: |
           # walproposer-lib pulls in neon-pg-ext-v17 → postgres-install-v17
           # as a dependency chain, so a single target builds the whole
