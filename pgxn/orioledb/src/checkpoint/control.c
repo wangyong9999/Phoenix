@@ -198,27 +198,40 @@ write_checkpoint_control(CheckpointControl *control)
 	 * Neon Plan E: emit control file as FPI to PageServer.
 	 * Uses fake relation (dbOid=0, relNumber=0) so GetPage can
 	 * serve it on restart without local files.
+	 *
+	 * Skip during shutdown checkpoint: XLogInsertAllowed() is still
+	 * true at the moment the shutdown checkpoint starts, but by the
+	 * time we finish inserting here PG has transitioned to "database
+	 * system is shutting down" and triggers a PANIC with "concurrent
+	 * write-ahead log activity". The previous checkpoint's FPI plus
+	 * SafeKeeper WAL since then is enough to recover on restart, so
+	 * losing this shutdown FPI is safe.
 	 */
-	if (smgr_hook != NULL && !RecoveryInProgress() && XLogInsertAllowed())
 	{
-		RelFileLocator rlocator;
-		char		page[BLCKSZ];
+		extern bool checkpoint_is_shutdown;
 
-		rlocator.spcOid = DEFAULTTABLESPACE_OID;
-		rlocator.dbOid = 0;
-		rlocator.relNumber = ORIOLEDB_CONTROL_FILE_OID;
+		if (smgr_hook != NULL && !RecoveryInProgress()
+			&& !checkpoint_is_shutdown && XLogInsertAllowed())
+		{
+			RelFileLocator rlocator;
+			char		page[BLCKSZ];
 
-		/* Pack control data into a standard 8KB page */
-		memset(page, 0, BLCKSZ);
-		memcpy(page, buffer, Min(CHECKPOINT_CONTROL_FILE_SIZE, BLCKSZ));
+			rlocator.spcOid = DEFAULTTABLESPACE_OID;
+			rlocator.dbOid = 0;
+			rlocator.relNumber = ORIOLEDB_CONTROL_FILE_OID;
 
-		XLogBeginInsert();
-		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, 0,
-						  page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
+			/* Pack control data into a standard 8KB page */
+			memset(page, 0, BLCKSZ);
+			memcpy(page, buffer, Min(CHECKPOINT_CONTROL_FILE_SIZE, BLCKSZ));
 
-		elog(LOG, "OrioleDB: control file FPI emitted (chkp=%u, replayStartPtr=%X/%X)",
-			 control->lastCheckpointNumber,
-			 LSN_FORMAT_ARGS(control->replayStartPtr));
+			XLogBeginInsert();
+			XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, 0,
+							  page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+			XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
+
+			elog(LOG, "OrioleDB: control file FPI emitted (chkp=%u, replayStartPtr=%X/%X)",
+				 control->lastCheckpointNumber,
+				 LSN_FORMAT_ARGS(control->replayStartPtr));
+		}
 	}
 }
