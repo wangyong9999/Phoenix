@@ -22,28 +22,86 @@ ROWS="${ROWS:-100}"
 ENDPOINT_NAME="${ENDPOINT_NAME:-main}"
 PSQL_DB="${PSQL_DB:-postgres}"
 PSQL_USER="${PSQL_USER:-cloud_admin}"
+READY_TIMEOUT="${READY_TIMEOUT:-60}"
 
 section() { printf '\n==> %s\n' "$*"; }
 
+# Dump daemon and compute logs so that failures in CI are self-describing
+# — the .neon/ artifact upload is best-effort and was empty on the first
+# run, so surface everything through the job log directly.
+dump_logs() {
+    echo ""
+    echo "---- .neon/ log dump (last 200 lines per file) ----"
+    if [ -d .neon ]; then
+        find .neon -name '*.log' -print 2>/dev/null | while read -r f; do
+            echo ""
+            echo "### $f"
+            tail -200 "$f" 2>/dev/null || true
+        done
+    else
+        echo "(.neon/ not present)"
+    fi
+}
+
 cleanup() {
-    cargo neon stop 2>/dev/null || true
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        dump_logs
+    fi
+    cargo neon stop >/dev/null 2>&1 || true
+    return "$rc"
 }
 trap cleanup EXIT
 
+# Wait until a TCP port on 127.0.0.1 accepts connections, or fail.
+wait_for_port() {
+    local port="$1" name="${2:-port $1}" deadline=$(( SECONDS + READY_TIMEOUT ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+            exec 3>&- 3<&- || true
+            echo "  $name ready on 127.0.0.1:$port"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "FAIL: $name did not accept on 127.0.0.1:$port within ${READY_TIMEOUT}s" >&2
+    return 1
+}
+
+# Poll pg_isready on the compute port until it returns 0 or we give up.
+wait_for_psql() {
+    local port="$1" deadline=$(( SECONDS + READY_TIMEOUT ))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if pg_isready -h 127.0.0.1 -p "$port" -U "$PSQL_USER" -d "$PSQL_DB" \
+             >/dev/null 2>&1; then
+            echo "  compute accepting SQL on port $port"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "FAIL: compute not ready on port $port within ${READY_TIMEOUT}s" >&2
+    return 1
+}
+
 section "[1/9] Reset .neon state"
-cargo neon stop 2>/dev/null || true
+cargo neon stop >/dev/null 2>&1 || true
 rm -rf .neon
 
 section "[2/9] cargo neon init"
-cargo neon init 2>&1 | tail -3
+cargo neon init
 
 section "[3/9] cargo neon start"
-cargo neon start 2>&1 | tail -5
+cargo neon start
+# Full storage stack (pageserver 64000, safekeeper default 5454,
+# storage_broker) started in the background. Give them a moment
+# before creating tenants, but rely on the tenant-create step
+# itself to exercise the full readiness.
+sleep 3
 
 section "[4/9] Create tenant + endpoint"
-cargo neon tenant create --set-default 2>&1 | tail -3
-cargo neon endpoint create "$ENDPOINT_NAME" 2>&1 | tail -3
-cargo neon endpoint start  "$ENDPOINT_NAME" 2>&1 | tail -5
+cargo neon tenant create --set-default
+cargo neon endpoint create "$ENDPOINT_NAME"
+cargo neon endpoint start  "$ENDPOINT_NAME"
 
 # Resolve the compute port from neon_local output rather than assuming
 # a default — neon_local can change its allocation strategy.
@@ -52,6 +110,8 @@ COMPUTE_PORT="$(cargo neon endpoint list 2>/dev/null \
     | head -1)"
 COMPUTE_PORT="${COMPUTE_PORT:-55432}"
 echo "compute port: $COMPUTE_PORT"
+
+wait_for_psql "$COMPUTE_PORT"
 
 run_psql() {
     psql -p "$COMPUTE_PORT" -h 127.0.0.1 -U "$PSQL_USER" -d "$PSQL_DB" \
@@ -90,10 +150,11 @@ section "[6/9] CHECKPOINT — flush FPIs to PageServer"
 run_psql -c "CHECKPOINT"
 
 section "[7/9] Stop + start endpoint (stateless restart)"
-cargo neon endpoint stop "$ENDPOINT_NAME" 2>&1 | tail -3
+cargo neon endpoint stop "$ENDPOINT_NAME"
 # Sleep briefly to let SafeKeeper flush and endpoint teardown settle.
 sleep 2
-cargo neon endpoint start "$ENDPOINT_NAME" 2>&1 | tail -5
+cargo neon endpoint start "$ENDPOINT_NAME"
+wait_for_psql "$COMPUTE_PORT"
 
 section "[8/9] Reconnect + verify data survived restart"
 AFTER_COUNT="$(run_psql -c "SELECT count(*) FROM serverless_verify")"
