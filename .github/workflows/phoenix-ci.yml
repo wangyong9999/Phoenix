@@ -14,10 +14,24 @@ jobs:
   rust-check:
     name: Rust Check & Clippy
     runs-on: ubuntu-latest
+    env:
+      # OrioleDB-Serverless only targets Postgres v17; skip v14/v15/v16 to avoid
+      # depending on a fork of the Postgres submodule that doesn't exist under
+      # the Phoenix namespace.
+      POSTGRES_VERSIONS: v17
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+
+      - name: Init v17 submodule only
+        run: |
+          # The .gitmodules uses a relative URL `../postgres.git` which resolves
+          # to `wangyong9999/postgres` on this fork (doesn't exist). Override
+          # to the upstream neondatabase/postgres mirror for CI only.
+          git config --file=.gitmodules submodule.vendor/postgres-v17.url https://github.com/neondatabase/postgres.git
+          git submodule sync -- vendor/postgres-v17
+          git submodule update --init --depth 2 --progress vendor/postgres-v17
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -46,11 +60,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: pg_install
-          key: ${{ runner.os }}-pg-headers-${{ hashFiles('vendor/postgres-v14/configure', 'vendor/postgres-v15/configure', 'vendor/postgres-v16/configure', 'vendor/postgres-v17/configure') }}
+          key: ${{ runner.os }}-pg-headers-v17-${{ hashFiles('vendor/postgres-v17/configure') }}
 
-      - name: Install Postgres headers (all versions)
+      - name: Install Postgres v17 headers
         if: steps.cache-pg-headers.outputs.cache-hit != 'true'
-        run: make postgres-headers-install
+        run: make postgres-headers-install-v17
 
       - name: Cargo check (compute_tools)
         run: cargo check -p compute_tools
