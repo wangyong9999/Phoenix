@@ -19,27 +19,24 @@ jobs:
         with:
           submodules: false
 
-      - name: Init Postgres submodules (v14-v17)
+      - name: Populate Postgres v14/v15/v16 from upstream
         run: |
-          set -x
-          # Debug: confirm .gitmodules is present after checkout
-          ls -la .gitmodules || echo "no .gitmodules"
-          cat .gitmodules || true
-          git config --list | grep -E '^submodule\.' || echo "no submodule config"
-          git ls-files --error-unmatch vendor/postgres-v17 || echo "v17 gitlink not indexed"
-          # The .gitmodules uses a relative URL `../postgres.git` which resolves
-          # to `wangyong9999/postgres` on this fork (doesn't exist). Rewrite
-          # each Postgres submodule URL to the upstream neondatabase/postgres
-          # mirror before init+update. postgres_ffi's build.rs hardcodes the
-          # v14..v17 list via a macro, so all four header sets must be present.
-          for v in v14 v15 v16 v17; do
-            git config --file=.gitmodules submodule.vendor/postgres-$v.url https://github.com/neondatabase/postgres.git
+          # In the Phoenix fork, vendor/postgres-v17 was committed as a regular
+          # subtree (not a gitlink), so it's always present. v14/v15/v16 are
+          # absent and must be fetched from neondatabase/postgres. postgres_ffi's
+          # build.rs iterates over v14..v17 via the for_all_postgres_versions!
+          # macro, so all four header sets must exist at build time.
+          set -e
+          for v in 14 15 16; do
+            if [ ! -f "vendor/postgres-v${v}/configure" ]; then
+              rm -rf "vendor/postgres-v${v}"
+              git clone --depth 1 --branch "REL_${v}_STABLE_neon" \
+                https://github.com/neondatabase/postgres.git "vendor/postgres-v${v}"
+            fi
           done
-          git submodule init
-          git submodule sync
-          git submodule update --depth 2 --progress
-          # Verify
-          ls vendor/postgres-v17/configure vendor/postgres-v16/configure vendor/postgres-v15/configure vendor/postgres-v14/configure
+          # Sanity check: every version has configure
+          ls vendor/postgres-v14/configure vendor/postgres-v15/configure \
+             vendor/postgres-v16/configure vendor/postgres-v17/configure
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
