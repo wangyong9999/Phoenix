@@ -20,6 +20,12 @@ This exercises the complete page-level delta WAL → wal-redo pipeline:
 
 ## Phase 6.5: Sys-tree descriptor lifecycle on stateless restart
 
+> **Status:** Candidate fix in flight — commit `1684e2e` hoists the
+> deferred control-file load out of `checkpointable_tree_init` into
+> `sys_tree_init_if_needed`. Verification pending CI run
+> `24560180590`. If E2E reaches `[9/9] PASS`, close this phase and
+> cut v0.1.0-alpha.2 per the Release Gate.
+
 **Symptom** observed in Phoenix CI run `24558882594` (step 7,
 fresh backend after stateless restart):
 
@@ -43,17 +49,28 @@ autovacuum launcher → GetSnapshotData → orioledb snapshot hook
   (autovacuum launcher) hit the OrioleDB snapshot hook and tripped
   the assert initializing sys tree `(1, 2)` with `chkp_num=3`.
 
-**Hypothesis (needs verification):** `sys_trees_reset_initialized()`
-resets the `initialized` flag for all 24 sys trees, but the
-deferred-load path only fully re-initializes the tree that
-triggered the load. The remaining 23 trees enter a half-state
-where `initialized=false` but shared `metaPageBlkno` is either
-never re-allocated or was freed — so the first fresh backend that
-touches any of them via `init_shmem=true` / `false` sees an
-invalid `metaPageBlkno`. There are 6 assignment sites for
-`metaPageBlkno = OInvalidInMemoryBlkno` in the tree; the
-reset → re-init state machine needs to be mapped end-to-end
-before making a change.
+**Actual root cause (identified 2026-04-17):** Not the hypothesis
+above — the fault is specifically in the *timing* of
+`sys_trees_reset_initialized()`. The old code called it from inside
+`checkpointable_tree_init`, which in turn is called from the middle
+of `sys_tree_init(i, init_shmem=true)`. By the time the reset runs,
+`sys_tree_init` has already written the freshly allocated
+`metaPageBlkno` into `sysTreesShmemHeaders[i].rootInfo`. The reset
+nukes it, the caller returns unaware, and
+`sys_tree_init_if_needed` then sets
+`header[i].initialized = true`. Header `i` is now permanently in a
+`{initialized=true, metaPageBlkno=invalid}` state. The next fresh
+backend (a process where `sysTreesDescrs[i].initialized=false`
+locally) reads `header[i]`, sees `initialized=true`, takes the
+`sys_tree_init(i, init_shmem=false)` branch, copies the invalid
+`metaPageBlkno` into its local descriptor, and the next
+`BTREE_GET_META(td)` dereference trips the assert.
+
+Trees `i=0, i=2..23` escape the trap: `i=0` is `BTreeStorageInMemory`
+(skips the path entirely), and `i=2..23` see `lastCheckpointNumber
+!= 0` so the deferred-load branch no longer fires for them. Only
+`i=1` — sys tree `(1, 2)` — is left poisoned, matching the crash
+address.
 
 **Not a workaround candidate.** Disabling autovacuum or
 max_worker_processes just delays the crash until the first real
@@ -62,21 +79,15 @@ shared-memory state cleanly after `sys_trees_reset_initialized()`,
 or skip the reset when `lastCheckpointNumber` is already non-zero
 and the control file contents are coherent.
 
-**Investigation steps:**
-
-1. Instrument `checkpointable_tree_init` to log `init_shmem` and
-   `desc->rootInfo.metaPageBlkno` on entry per call, so we can
-   distinguish "never set" from "set then cleared".
-2. Trace the caller of `checkpointable_tree_init` from the snapshot
-   hook — is it going through `sys_tree_get_any_chkp` /
-   `get_sys_tree`? Does it pass `init_shmem=true` the second time?
-3. Map every assignment to `metaPageBlkno` and every
-   `ppool_get_page(..., PPOOL_RESERVE_META)` call. Which path runs
-   in 55015 that didn't run in 55007?
-4. Consider: `sys_trees_reset_initialized()` should only be called
-   when the control file genuinely changes the per-tree chkp_num
-   (not on every deferred-load — many sys trees may already be at
-   the right chkp_num).
+**Fix applied (`1684e2e`):** Move the deferred control file load
+into a new `sys_trees_load_control_if_deferred()` helper and call
+it at the very top of `sys_tree_init_if_needed`, before the per-tree
+alloc loop starts handing out `metaPageBlkno` pages. The reset now
+runs while all headers are still in their initial-shmem invalid
+state, so the alloc loop hands out fresh pages cleanly and no
+header ends up half-initialized. The old call site inside
+`checkpointable_tree_init` is removed; a comment there records why
+and points readers to the new helper.
 
 ## Phase 7: Full CRUD + Structural Operations
 
