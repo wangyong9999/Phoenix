@@ -2930,8 +2930,14 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	 * Includes sys trees and the end-of-recovery checkpoint run from the
 	 * startup process. Seq-buf readers need the full file — mirroring only
 	 * the header would force a PANIC on stateless restart.
+	 *
+	 * Skip during shutdown checkpoint: a late XLogInsert while PG is
+	 * tearing down WAL insertion triggers the "concurrent write-ahead
+	 * log activity while database system is shutting down" PANIC (same
+	 * pattern as write_page_to_disk / write_checkpoint_control). The
+	 * prior regular checkpoint's map file FPIs are sufficient to recover.
 	 */
-	if (smgr_hook != NULL && XLogInsertAllowed())
+	if (smgr_hook != NULL && !checkpoint_is_shutdown && XLogInsertAllowed())
 	{
 		RelFileLocator rlocator;
 		char		page[BLCKSZ];
