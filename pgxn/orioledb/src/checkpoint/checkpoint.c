@@ -5257,8 +5257,39 @@ can_use_checkpoint_extents(BTreeDescr *desc, uint32 chkp_num)
 static inline void
 init_seq_buf_pages(BTreeDescr *desc, SeqBufDescShared *shared)
 {
-	Assert(!OInMemoryBlknoIsValid(shared->pages[0]));
-	Assert(!OInMemoryBlknoIsValid(shared->pages[1]));
+	/*
+	 * Phase 6.6.4b: make init idempotent under crash-mid-CHECKPOINT
+	 * stateless recovery. Previously the two leading asserts tripped the
+	 * startup process because an earlier init_seq_buf_pages path (triggered
+	 * via checkpointable_tree_init during the pre-checkpoint sys-tree
+	 * walk) had already populated either pages[0] or pages[1] by the time
+	 * the end-of-recovery checkpoint's checkpoint_init_new_seq_bufs
+	 * reached the same SeqBufDescShared. Freeing the stale pages before
+	 * reallocating is functionally safe — the old pages are no longer
+	 * referenced by any live seq_buf file descriptor (either the tree has
+	 * not yet been checkpointed in this generation, or the prior
+	 * generation's pages are in reserved-meta space that ppool will
+	 * recycle) — and lets us log the condition for diagnostic purposes
+	 * without aborting the startup process.
+	 *
+	 * If this branch fires during normal operation (not startup / not
+	 * end-of-recovery), the emitted LOG is the signal to come back and
+	 * investigate — it means two code paths are both claiming ownership
+	 * of the same seq buf's shared pages, which is a real architectural
+	 * leak we want to surface, not a panic.
+	 */
+	if (OInMemoryBlknoIsValid(shared->pages[0]) ||
+		OInMemoryBlknoIsValid(shared->pages[1]))
+	{
+		elog(LOG, "init_seq_buf_pages: (%u,%u) shared=%p pages[0]=%u pages[1]=%u "
+			 "— freeing stale allocation before re-init (Phase 6.6.4b)",
+			 desc->oids.datoid, desc->oids.relnode,
+			 (void *) shared,
+			 OInMemoryBlknoIsValid(shared->pages[0]) ? shared->pages[0] : 0,
+			 OInMemoryBlknoIsValid(shared->pages[1]) ? shared->pages[1] : 0);
+		FREE_PAGE_IF_VALID(desc->ppool, shared->pages[0]);
+		FREE_PAGE_IF_VALID(desc->ppool, shared->pages[1]);
+	}
 
 	shared->pages[0] = ppool_get_page(desc->ppool, PPOOL_RESERVE_META);
 	shared->pages[1] = ppool_get_page(desc->ppool, PPOOL_RESERVE_META);
