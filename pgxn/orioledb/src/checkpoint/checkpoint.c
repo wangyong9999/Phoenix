@@ -1605,6 +1605,13 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 
 	ppool_reserve_pages(descr->ppool, PPOOL_RESERVE_META, 4);
 
+	elog(LOG, "ckpt_init_new: (%u,%u) chkpNum=%d next_chkp_index=%d "
+		 "tmpBuf[next]=%p nextChkp[next]=%p",
+		 descr->oids.datoid, descr->oids.relnode,
+		 chkpNum, next_chkp_index,
+		 (void *) &meta_page->tmpBuf[next_chkp_index],
+		 (void *) &meta_page->nextChkp[next_chkp_index]);
+
 	init_seq_buf_pages(descr, &meta_page->tmpBuf[next_chkp_index]);
 
 	memset(&next_tmp_tag, 0, sizeof(next_tmp_tag));
@@ -5361,6 +5368,22 @@ checkpointable_tree_fill_seq_buffers(BTreeDescr *td, bool init,
 			&meta_page->tmpBuf[chkp_index],
 		&meta_page->freeBuf};
 		int			i;
+
+		/*
+		 * Phase 6.6.4b diagnostic: print exactly which slots (and their
+		 * shared-memory addresses) this init path is about to allocate
+		 * for. If the Phase 6.6.4b idempotent guard elsewhere fires on
+		 * addresses that overlap with these, we've found the path that
+		 * double-inits; if not, the leak is happening through some other
+		 * call site we haven't traced yet.
+		 */
+		elog(LOG, "ckpt_fill: (%u,%u) chkp_num=%u chkp_index=%d init=%d "
+			 "nextChkp[i]=%p tmpBuf[i]=%p freeBuf=%p",
+			 td->oids.datoid, td->oids.relnode,
+			 chkp_num, chkp_index, init,
+			 (void *) &meta_page->nextChkp[chkp_index],
+			 (void *) &meta_page->tmpBuf[chkp_index],
+			 (void *) &meta_page->freeBuf);
 
 		for (i = 0; i < (is_compressed ? 2 : 3); i++)
 			init_seq_buf_pages(td, shareds[i]);
