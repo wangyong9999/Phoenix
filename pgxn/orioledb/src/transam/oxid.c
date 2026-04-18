@@ -18,6 +18,7 @@
 
 #include "recovery/recovery.h"
 #include "transam/oxid.h"
+#include "transam/undo.h"	/* fsync_undo_range for M1.2 commit barrier */
 #include "utils/dsa.h"
 #include "utils/o_buffers.h"
 
@@ -1478,6 +1479,57 @@ current_oxid_commit(CommitSeqNo csn)
 		return;
 
 	storedCsn = csn | (enable_rewind ? COMMITSEQNO_RETAINED_FOR_REWIND : 0);
+
+	/*
+	 * Phase M1.2 (Neon Log-is-Data commit barrier — undo flush):
+	 * Flush this backend's undo writes for every undo type before assigning
+	 * the CSN. Invariant: once commit barrier is crossed, every
+	 * tuphdr.undoLocation emitted by this txn's data-page delta WAL points
+	 * at undo content that's already in SafeKeeper. Without this, a new
+	 * compute reading the table post-crash sees tuphdr.undoLocation
+	 * referring to undo bytes that only existed in the crashed compute's
+	 * lazy Plan B buffer — PageServer returns stale/zero bytes and
+	 * visibility judges the tuple as "aborted / in-progress" → row
+	 * invisible, SELECT count=0 (concrete mechanism of Phase 6.6.4c-3).
+	 *
+	 * Use fsync_undo_range (same public API that checkpoint uses at
+	 * checkpoint.c:1378): evict_undo_to_disk for the in-flight range and
+	 * o_buffers_sync the dirty buffers — both trigger the Plan B FPI
+	 * emit (write_buffer_data -> XLogRegisterBlock(REGBUF_FORCE_IMAGE) ->
+	 * XLogInsert). Commit's XACT record's XLogFlush then pushes all the
+	 * FPI records to SafeKeeper.
+	 *
+	 * Range: [writtenLocation (last flushed by any backend), cur backend
+	 * tip]. Already-flushed blocks are skipped by o_buffers_flush's
+	 * "buffer->dirty" check, so no-op for clean ones.
+	 *
+	 * Only in Neon mode. Standalone OrioleDB keeps the lazy-flush model.
+	 */
+	if (smgr_hook != NULL)
+	{
+		int			i;
+
+		for (i = 0; i < (int) UndoLogsCount; i++)
+		{
+			UndoLogType undoType = (UndoLogType) i;
+			UndoStackLocations locs;
+
+			get_cur_undo_locations(&locs, undoType);
+			if (UndoLocationIsValid(locs.location))
+			{
+				UndoMeta   *meta = get_undo_meta_by_type(undoType);
+				UndoLocation flushed;
+
+				flushed = pg_atomic_read_u64(&meta->writtenLocation);
+				if (locs.location > flushed)
+				{
+					fsync_undo_range(undoType, flushed, locs.location,
+									 WAIT_EVENT_SLRU_SYNC);
+				}
+			}
+		}
+	}
+
 	set_oxid_csn(curOxid, storedCsn);
 
 	/*
