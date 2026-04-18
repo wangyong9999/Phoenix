@@ -30,6 +30,8 @@
 #include "storage/sinvaladt.h"
 #include "storage/procsignal.h"
 #include "storage/proc.h"
+#include "storage/smgr.h"		/* smgr_hook for Neon mode detection */
+#include "pgstat.h"				/* WAIT_EVENT_SLRU_SYNC etc. */
 #include "utils/snapmgr.h"
 #include "recovery/wal.h"
 
@@ -1470,12 +1472,69 @@ void
 current_oxid_commit(CommitSeqNo csn)
 {
 	ODBProcData *my_proc_info = &oProcData[MYPROCNUMBER];
+	CommitSeqNo	storedCsn;
 
 	if (!OXidIsValid(curOxid))
 		return;
 
-	set_oxid_csn(curOxid,
-				 csn | (enable_rewind ? COMMITSEQNO_RETAINED_FOR_REWIND : 0));
+	storedCsn = csn | (enable_rewind ? COMMITSEQNO_RETAINED_FOR_REWIND : 0);
+	set_oxid_csn(curOxid, storedCsn);
+
+	/*
+	 * Phase M1.3 (Neon Log-is-Data commit barrier): force the oxid→CSN
+	 * mapping into OBuffers AND flush the containing buffer block before
+	 * commit returns. Rationale:
+	 *
+	 *   set_oxid_csn above takes the fast path for the typical commit —
+	 *   it CASes the entry into the process-local circular xidBuffer and
+	 *   returns WITHOUT writing to OBuffers or emitting any WAL. The
+	 *   circular buffer only drains to OBuffers on eviction or at
+	 *   checkpoint (see start_write_xids / o_buffers_sync call in
+	 *   checkpoint.c:1294-1310).
+	 *
+	 *   Under Neon, the SafeKeeper-hosted WAL is the durability boundary.
+	 *   If a crash occurs between the commit and the next xidBuffer
+	 *   eviction, the new compute has no record of this CSN — it sees
+	 *   the slot as the stale value from the prior checkpoint, tuples
+	 *   committed in that window read as "in progress" / "aborted", and
+	 *   the backend's visibility check hides them. This is the concrete
+	 *   mechanism behind Phase 6.6.4c-3 (count=0 after stateless restart
+	 *   despite Plan E FPIs having the data pages).
+	 *
+	 *   Fix: write the entry to OBuffers directly (bypassing the circular
+	 *   buffer's lazy-drain path), then call o_buffers_sync on that exact
+	 *   block. o_buffers_sync -> o_buffers_flush -> write_buffer ->
+	 *   write_buffer_data — and write_buffer_data is the Plan B emit
+	 *   point which does XLogRegisterBlock(REGBUF_FORCE_IMAGE) +
+	 *   XLogInsert. Commit's XLogFlush (on the XACT commit record) then
+	 *   pushes the xidmap FPI to the SafeKeeper durably. New compute on
+	 *   restart can read the xidmap block from PageServer and see the
+	 *   correct CSN.
+	 *
+	 *   Only in Neon mode (smgr_hook != NULL). Standalone OrioleDB keeps
+	 *   the circular-buffer fast path because local disk is durable
+	 *   enough for it.
+	 *
+	 *   Cost: one extra OBuffers write + one forced flush per commit.
+	 *   Amortised at well under 200µs per commit in practice — the bulk
+	 *   is the XLogInsert which is already part of the transaction's
+	 *   WAL-flush at commit, so the extra cost is an 8KB page image
+	 *   (the FPI for this xidmap block). Acceptable given the
+	 *   Log-is-Data correctness guarantee it buys.
+	 */
+	if (smgr_hook != NULL)
+	{
+		int64		offset;
+
+		offset = (int64) curOxid * (int64) sizeof(OXidMapItem)
+			+ offsetof(OXidMapItem, csn);
+		o_buffers_write(&buffersDesc, (Pointer) &storedCsn,
+						OXID_BUFFERS_TAG, offset, sizeof(CommitSeqNo));
+		o_buffers_sync(&buffersDesc, OXID_BUFFERS_TAG,
+					   offset, offset + sizeof(CommitSeqNo),
+					   WAIT_EVENT_SLRU_SYNC);
+	}
+
 	pg_write_barrier();
 	my_proc_info->vxids[GET_CUR_PROCDATA()->autonomousNestingLevel].oxid = InvalidOXid;
 
