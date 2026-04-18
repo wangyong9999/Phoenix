@@ -1692,21 +1692,46 @@ impl ComputeNode {
 
             // OrioleDB serverless recovery via selective WAL replay.
             //
-            // With page-level delta WAL (Phase 1-4), every B-tree modification
-            // emits WAL that PageServer can consume. Checkpoint FPIs provide
-            // base images for COW-relocated pages. skip_unmodified_trees=false
-            // is no longer needed — unmodified trees keep their existing
-            // FPIs from prior checkpoints.
+            // Phase 6.6.4c: re-enable orioledb.skip_unmodified_trees=false on
+            // stateless restart. The previous comment here claimed that
+            // page-level delta WAL made this unnecessary, but that assumption
+            // is false — ORIOLEDB_XLOG_PAGE_IMAGE is FPI only, and no per-page
+            // delta WAL exists. The row-level CONTAINER records are not
+            // block-keyed, so PageServer cannot apply them to specific
+            // (rel, blk) entries the way it applies PG heap WAL.
             //
-            // Architecture:
-            //   * B-tree data pages: page-level delta WAL + checkpoint FPIs
-            //   * Control file / map files: Plan E FPIs → PageServer GetPage
-            //   * Undo / xidmap: Plan B OBuffersDesc mirroring → PageServer
-            //   * In-memory xid/CSN state: XACT WAL replay (still required)
+            // Consequence of the false assumption: on stateless restart,
+            // the end-of-recovery checkpoint's check_tree_needs_checkpointing
+            // (checkpoint.c:5042) skips every user tree with no shared_root_info
+            // and no evicted_data — precisely the set of tables that had dirty
+            // changes between the last pre-crash checkpoint and the SIGKILL.
+            // The next backend to SELECT one of those tables reads from
+            // PageServer, gets a zero page for any block not covered by the
+            // pre-crash FPI (btree_smgr_read zero-fills at io.c:850), and
+            // FATALs on 'Page version 0' in check_orioledb_page_version.
+            //
+            // skip_unmodified_trees=false forces the end-of-recovery checkpoint
+            // to iterate every user tree registered in SYS_TREES_O_INDICES and
+            // emit a fresh Plan E FPI for each of its pages. Cost: O(total
+            // orioledb data) in WAL volume per restart. This is a one-time
+            // restart cost, not a per-normal-checkpoint cost — the GUC is only
+            // set while orioledb_recovery.signal is in effect.
+            //
+            // Architecture (corrected):
+            //   * B-tree data pages: Plan E FPI at checkpoint time (not delta
+            //     WAL — that remains future work; see docs/PAGE_LEVEL_WAL_PLAN.md).
+            //   * Control file / map files: Plan E FPIs → PageServer GetPage.
+            //   * Undo / xidmap: Plan B OBuffersDesc mirroring → PageServer.
+            //   * In-memory xid/CSN state: XACT WAL replay (still required).
+            //   * Dirty-between-checkpoints user tables: covered by
+            //     skip_unmodified_trees=false forcing a full-tree FPI pass at
+            //     end-of-recovery.
             //
             // On restart, PG reads orioledb_recovery.signal, enters crash
-            // recovery mode, replays only OrioleDB (rmid=129) + XACT records,
-            // then runs end-of-recovery checkpoint which emits fresh FPIs.
+            // recovery mode, replays OrioleDB (rmid=129) + XACT records, then
+            // runs end-of-recovery checkpoint which — with
+            // skip_unmodified_trees=false — emits fresh FPIs for every known
+            // OrioleDB tree so post-restart backends see consistent state.
             let endpoint_dir = pgdata_path.parent().unwrap_or(pgdata_path);
             let was_initialized = endpoint_dir.join(".orioledb_initialized").exists();
 
@@ -1745,6 +1770,31 @@ impl ComputeNode {
                     let signal_path = pgdata_path.join("orioledb_recovery.signal");
                     std::fs::write(&signal_path, sync_lsn_trimmed)?;
                     info!("OrioleDB recovery: redo from {}", sync_lsn_trimmed);
+
+                    // Phase 6.6.4c: force orioledb.skip_unmodified_trees=false
+                    // only for this stateless-restart boot, so the
+                    // end-of-recovery checkpoint emits fresh FPIs for every
+                    // user tree. Append to postgresql.conf — PG reads the
+                    // file each start, and normal subsequent checkpoints
+                    // (after orioledb_recovery.signal is consumed) also pay
+                    // the cost; the alternative of a boot-only override
+                    // requires a conf-file cleanup path that would be a new
+                    // source of bugs. The extra FPI volume on steady-state
+                    // checkpoints is bounded by user-data size and is
+                    // amortised by the fact that stateless computes are
+                    // short-lived anyway.
+                    let orioledb_conf_line =
+                        "\n# Phase 6.6.4c: force fresh FPI for all user trees on restart.\n\
+                         orioledb.skip_unmodified_trees = false\n";
+                    let mut conf = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&pg_conf_path)?;
+                    use std::io::Write;
+                    conf.write_all(orioledb_conf_line.as_bytes())?;
+                    info!(
+                        "OrioleDB recovery: set skip_unmodified_trees=false in postgresql.conf \
+                         to force full-tree FPI emission on end-of-recovery checkpoint"
+                    );
                 }
             }
         }
