@@ -194,8 +194,20 @@ jobs:
         env:
           ROWS: "100"
 
+      - name: Run crash-mid-checkpoint recovery (Phase 6.6.4 gate)
+        # This E2E kills the compute during a CHECKPOINT and asserts
+        # that stateless restart reconstructs the pre-crash dataset
+        # byte-identically. Kept in the same job so it reuses the
+        # already-built artifacts from the steps above (building the
+        # full native stack twice on every push would double the
+        # job time for zero added coverage).
+        id: e2e_crash
+        run: bash scripts/test_e2e_crash_mid_ckpt.sh
+        env:
+          ROWS: "500"
+
       - name: Upload .neon logs on failure
-        if: always() && steps.e2e.outcome != 'success'
+        if: always() && (steps.e2e.outcome != 'success' || steps.e2e_crash.outcome != 'success')
         uses: actions/upload-artifact@v4
         with:
           name: neon-logs-${{ github.run_id }}
