@@ -1605,7 +1605,7 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 
 	ppool_reserve_pages(descr->ppool, PPOOL_RESERVE_META, 4);
 
-	elog(LOG, "ckpt_init_new: (%u,%u) chkpNum=%d next_chkp_index=%d "
+	elog(DEBUG1, "ckpt_init_new: (%u,%u) chkpNum=%d next_chkp_index=%d "
 		 "tmpBuf[next]=%p nextChkp[next]=%p",
 		 descr->oids.datoid, descr->oids.relnode,
 		 chkpNum, next_chkp_index,
@@ -5288,7 +5288,7 @@ init_seq_buf_pages(BTreeDescr *desc, SeqBufDescShared *shared)
 	if (OInMemoryBlknoIsValid(shared->pages[0]) ||
 		OInMemoryBlknoIsValid(shared->pages[1]))
 	{
-		elog(LOG, "init_seq_buf_pages: (%u,%u) shared=%p pages[0]=%u pages[1]=%u "
+		elog(DEBUG1, "init_seq_buf_pages: (%u,%u) shared=%p pages[0]=%u pages[1]=%u "
 			 "— freeing stale allocation before re-init (Phase 6.6.4b)",
 			 desc->oids.datoid, desc->oids.relnode,
 			 (void *) shared,
@@ -5372,12 +5372,10 @@ checkpointable_tree_fill_seq_buffers(BTreeDescr *td, bool init,
 		/*
 		 * Phase 6.6.4b diagnostic: print exactly which slots (and their
 		 * shared-memory addresses) this init path is about to allocate
-		 * for. If the Phase 6.6.4b idempotent guard elsewhere fires on
-		 * addresses that overlap with these, we've found the path that
-		 * double-inits; if not, the leak is happening through some other
-		 * call site we haven't traced yet.
+		 * for. Kept at DEBUG1 so normal operation doesn't spam the log;
+		 * raise to LOG temporarily when diagnosing 6.6.4b-class bugs.
 		 */
-		elog(LOG, "ckpt_fill: (%u,%u) chkp_num=%u chkp_index=%d init=%d "
+		elog(DEBUG1, "ckpt_fill: (%u,%u) chkp_num=%u chkp_index=%d init=%d "
 			 "nextChkp[i]=%p tmpBuf[i]=%p freeBuf=%p",
 			 td->oids.datoid, td->oids.relnode,
 			 chkp_num, chkp_index, init,

@@ -245,18 +245,70 @@ never hit the "end-of-recovery checkpoint after crash + empty
 pgdata" path). 6.6.4 is the first test to drive that path, which
 is precisely what a release gate is for.
 
-**Follow-up work (Phase 6.6.4b, out of this session).**
-- Diagnose which seq-buf descriptor has `pages[0]` populated at
-  recovery-checkpoint start. Dump the owner tree, match to a
-  specific OrioleDB table's oid.
-- Determine whether the fix is to clear `shared->pages[*]`
-  analogous to Phase 6.5's `sys_trees_load_control_if_deferred`,
-  or to skip `init_seq_buf_pages` when the descriptor is already
-  populated from the rehydrate path.
-- Extend the crash E2E to also drive SPLIT and multi-table
-  workloads (today 6.6.4 only exercises a single primary-key
-  table; the bug may have more variants under heavier tree
-  mutation).
+**Diagnosis iteration 1 (shipped in v0.1.0-alpha.4 as an
+incremental safety belt, not a full fix).**
+
+- `init_seq_buf_pages` made idempotent: if the target shared has
+  valid `pages[0]` / `pages[1]`, free the stale blknos before
+  reallocating instead of asserting. The two trailing
+  `OInMemoryBlknoIsValid` asserts on the post-allocation state
+  are preserved, so the postcondition is unchanged.
+- Diagnostic `DEBUG1` logs added at the three sites that reach
+  `init_seq_buf_pages` (`ckpt_fill`, `ckpt_init_new`, and the
+  `freeing stale` line inside `init_seq_buf_pages` itself) so
+  future CI runs can tell which caller is responsible without
+  another code-chase.
+
+**Diagnosis iteration 1 findings (written 2026-04-18 from CI run
+`24601289309`, offered as handoff to 6.6.4b proper).** After the
+idempotent guard prevents the first assertion, a second
+`Assert(false)` fires at `src/utils/seq_buf.c:148` inside
+`get_seq_buf_filename` — the `free_buf_tag.type` byte read from
+`descr->freeBuf.shared->tag` is 0 rather than `'m'` or `'t'`,
+meaning the tag was never set (or was later zeroed) for the tree
+the end-of-recovery checkpoint is currently processing. The
+diagnostic logs also caught a strange arithmetic result:
+
+```
+LOG: orioledb checkpoint 4 started
+LOG: ckpt_init_new: (1,2) chkpNum=1 next_chkp_index=0
+     tmpBuf[next]=0x7f993b29e3d0 nextChkp[next]=0x7f993b29e350
+```
+
+The `chkpNum=1` here is smoking-gun evidence that
+`checkpoint_init_new_seq_bufs` was invoked with a
+`lastCheckpointNumber = 0` view of the world even though
+`o_perform_checkpoint` emitted `"checkpoint 4 started"` one line
+earlier with `lastCheckpointNumber = 3`. Possible mechanisms
+(not fully resolved in this session):
+
+  * `cur_chkp_num` captured at `o_perform_checkpoint` entry
+    somehow propagates as 1, not 4, through
+    `checkpoint_sys_trees` — points to a shared-memory layout
+    mismatch between pre-crash and post-crash processes, or an
+    interaction with `sys_trees_load_control_if_deferred`
+    firing mid-sequence.
+  * A second `o_perform_checkpoint` invocation runs concurrently
+    (backend, not startup) with stale state, emitting the `chkpNum=1`
+    line. Log shows same PID so this is unlikely but cannot be
+    fully excluded without stack traces.
+
+**Real fix (out of session).** Two approaches, pick after one more
+diagnostic round that prints `checkpoint_state->lastCheckpointNumber`
+at call site of `checkpoint_init_new_seq_bufs`:
+
+  1. Source-of-truth unification: every call site that needs
+     `chkpNum` reads it from `checkpoint_state` rather than
+     accepting it as a parameter. Removes the possibility of
+     param-vs-state divergence.
+  2. Make `sys_trees_load_control_if_deferred` completion a
+     precondition for entering `o_perform_checkpoint`. If
+     control hasn't loaded, skip or defer the checkpoint.
+     Avoids the `chkpNum=1` race.
+
+Extend the crash E2E to also drive SPLIT and multi-table
+workloads (today 6.6.4 only exercises a single primary-key table;
+the bug may have more variants under heavier tree mutation).
 
 **Release-gate consequence.** The Phoenix CI `serverless-e2e` job
 stays `continue-on-error: true` through v0.2.0-beta.1 because this
