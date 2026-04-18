@@ -1133,4 +1133,176 @@ mod tests {
             other => panic!("expected WalRecord(Postgres), got {other:?}"),
         }
     }
+
+    /// Phase 6.6.3: LSN externality invariant.
+    ///
+    /// PageServer addresses OrioleDB pages by (key, LSN) tuples held
+    /// in batch metadata, *not* by LSN bytes embedded inside the page.
+    /// This test locks in that invariant by emitting the same logical
+    /// page at two different LSNs and verifying:
+    ///
+    ///   1. The two emissions produce two independently addressable
+    ///      metadata entries that share the block key but carry the
+    ///      distinct LSNs that were supplied.
+    ///   2. The serialized `Value::Image` bytes are byte-identical
+    ///      across the two LSNs — no `page_set_lsn` ever overwrites
+    ///      any part of the page.
+    ///   3. The `OrioleDBPageHeader` prefix (bytes 0..8: state,
+    ///      pageChangeCount, checkpointNum) survives both emissions
+    ///      without mutation.
+    ///
+    /// If this assertion ever regresses, Neon's timeline machinery
+    /// (branching, PITR) has started relying on in-page LSNs for
+    /// OrioleDB pages — which is incompatible with OrioleDB's page
+    /// header layout and will silently corrupt the state prefix.
+    ///
+    /// There is no conflict between Neon's LSN and OrioleDB's CSN
+    /// (`checkpointNum`): LSN is a per-byte WAL offset tracked
+    /// externally by PageServer, CSN is an in-page epoch counter
+    /// used by OrioleDB for MVCC snapshots. The two coexist because
+    /// the LSN never enters the page body.
+    #[test]
+    fn test_orioledb_page_lsn_externality() {
+        use crate::models::FlushUncommittedRecords;
+
+        const SPC: u32 = 1663;
+        const DB: u32 = 24577;
+        const REL: u32 = 24578;
+        const BLKNO: u32 = 42;
+        const LSN_A: Lsn = Lsn(0x1000);
+        const LSN_B: Lsn = Lsn(0x8000);
+
+        // Build a page whose first 8 bytes are a distinctive
+        // OrioleDBPageHeader prefix: if any LSN write leaked into
+        // the page, the lower 8 bytes would be clobbered.
+        let mut page = vec![0u8; BLCKSZ as usize];
+        page[0..8].copy_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        page[4096] = 0xAB;
+        page[BLCKSZ as usize - 1] = 0xCD;
+        let page_bytes = Bytes::from(page.clone());
+
+        let emit = |lsn: Lsn| -> SerializedValueBatch {
+            let mut block = DecodedBkpBlock::new();
+            block.rnode_spcnode = SPC;
+            block.rnode_dbnode = DB;
+            block.rnode_relnode = REL;
+            block.forknum = 0;
+            block.blkno = BLKNO;
+            block.has_image = true;
+            block.apply_image = true;
+            block.will_init = true;
+            block.bimg_offset = 0;
+            block.bimg_len = BLCKSZ;
+
+            let decoded = DecodedWALRecord {
+                xl_xid: 7,
+                xl_info: 0x10,
+                xl_rmid: 129,
+                record: page_bytes.clone(),
+                blocks: vec![block],
+                main_data_offset: 0,
+                origin_id: 0,
+            };
+
+            let shard = ShardIdentity::unsharded();
+            let mut shard_records: HashMap<ShardIdentity, InterpretedWalRecord> =
+                HashMap::new();
+            shard_records.insert(
+                shard,
+                InterpretedWalRecord {
+                    metadata_record: None,
+                    batch: SerializedValueBatch::default(),
+                    next_record_lsn: lsn,
+                    flush_uncommitted: FlushUncommittedRecords::No,
+                    xid: 7,
+                },
+            );
+
+            SerializedValueBatch::from_decoded_filtered(
+                decoded,
+                &mut shard_records,
+                lsn,
+                PgMajorVersion::PG17,
+            )
+            .unwrap();
+
+            shard_records.remove(&shard).unwrap().batch
+        };
+
+        let batch_a = emit(LSN_A);
+        let batch_b = emit(LSN_B);
+
+        let rel = RelTag {
+            spcnode: SPC,
+            dbnode: DB,
+            relnode: REL,
+            forknum: 0,
+        };
+        let block_key = rel_block_to_key(rel, BLKNO).to_compact();
+
+        // Extract the FPI image entry from each batch and capture
+        // its metadata LSN.
+        let extract_image = |batch: &SerializedValueBatch| -> (Lsn, Bytes) {
+            let mut found: Option<(Lsn, Bytes)> = None;
+            for meta in &batch.metadata {
+                let ser = match meta {
+                    ValueMeta::Serialized(s) => s,
+                    ValueMeta::Observed(_) => continue,
+                };
+                if ser.key != block_key {
+                    continue;
+                }
+                let val = Value::des(&batch.raw[ser.batch_offset as usize..][..ser.len])
+                    .unwrap();
+                let img = match val {
+                    Value::Image(b) => b,
+                    other => panic!("expected Value::Image at block key, got {other:?}"),
+                };
+                assert!(found.is_none(), "more than one image entry per batch");
+                found = Some((ser.lsn, img));
+            }
+            found.expect("no FPI image entry found at block_key")
+        };
+
+        let (lsn_a_meta, image_a) = extract_image(&batch_a);
+        let (lsn_b_meta, image_b) = extract_image(&batch_b);
+
+        // Invariant 1: the metadata carries the LSN we emitted.
+        assert_eq!(lsn_a_meta, LSN_A);
+        assert_eq!(lsn_b_meta, LSN_B);
+        assert_ne!(
+            lsn_a_meta, lsn_b_meta,
+            "two emissions at distinct LSNs should produce distinct metadata LSNs"
+        );
+
+        // Invariant 2: the page body is byte-identical across the
+        // two LSNs — no LSN write ever touched the image.
+        assert_eq!(
+            image_a.len(),
+            BLCKSZ as usize,
+            "image A length must equal BLCKSZ"
+        );
+        assert_eq!(
+            image_b.len(),
+            BLCKSZ as usize,
+            "image B length must equal BLCKSZ"
+        );
+        assert_eq!(
+            image_a, image_b,
+            "OrioleDB page body must be byte-identical across LSN emissions; \
+             a diff implies page_set_lsn leaked into the rmid=129 path"
+        );
+
+        // Invariant 3: the OrioleDBPageHeader prefix survived both
+        // emissions. We already checked image_a == image_b, so one
+        // assertion on image_a covers both.
+        assert_eq!(
+            &image_a[0..8],
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+            "OrioleDBPageHeader prefix was mutated — LSN or some other \
+             header byte leaked into the page body"
+        );
+        assert_eq!(image_a[4096], 0xAB);
+        assert_eq!(image_a[BLCKSZ as usize - 1], 0xCD);
+    }
 }
