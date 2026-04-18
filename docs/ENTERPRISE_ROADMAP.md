@@ -293,22 +293,85 @@ earlier with `lastCheckpointNumber = 3`. Possible mechanisms
     line. Log shows same PID so this is unlikely but cannot be
     fully excluded without stack traces.
 
-**Real fix (out of session).** Two approaches, pick after one more
-diagnostic round that prints `checkpoint_state->lastCheckpointNumber`
-at call site of `checkpoint_init_new_seq_bufs`:
+**Root cause — resolved in iter3 (v0.1.0-alpha.4, commit
+`7393959`).** `o_perform_checkpoint` captured `cur_chkp_num` at
+function entry (line 1196), **before** the sys-tree pre-loop at
+line 1249 triggered `sys_trees_load_control_if_deferred`, which
+is what loads the control file from PageServer on post-crash
+stateless restart. That left `cur_chkp_num` frozen at 1 even
+though the live `checkpoint_state->lastCheckpointNumber` later
+read as 3.
 
-  1. Source-of-truth unification: every call site that needs
-     `chkpNum` reads it from `checkpoint_state` rather than
-     accepting it as a parameter. Removes the possibility of
-     param-vs-state divergence.
-  2. Make `sys_trees_load_control_if_deferred` completion a
-     precondition for entering `o_perform_checkpoint`. If
-     control hasn't loaded, skip or defer the checkpoint.
-     Avoids the `chkpNum=1` race.
+Downstream effects of the stale capture:
+  * `checkpoint_init_new_seq_bufs` received `chkpNum=1`, producing
+    `next_chkp_index = 0` — the same slot `ckpt_fill` just
+    populated, double-initialising it and tripping the original
+    `!OInMemoryBlknoIsValid(shared->pages[0])` assert.
+  * After iter1's idempotent guard, the free-then-realloc
+    scrubbed the `tmpBuf[0]`/`nextChkp[0]` tags, causing a
+    downstream `get_seq_buf_filename` assert on `tag.type=0`.
+  * After iter2's re-derive-from-live-state inside
+    `checkpoint_init_new_seq_bufs`, the slot indices were fixed
+    but `sort_checkpoint_map_file` still looked at `nextChkp[1]`
+    with num=5 (because `checkpoint_ix` had its own stale
+    `chkpNum = lastCheckpointNumber + 1` computation) and
+    FATAL'd on `2-5.map` not existing.
 
-Extend the crash E2E to also drive SPLIT and multi-table
-workloads (today 6.6.4 only exercises a single primary-key table;
-the bug may have more variants under heavier tree mutation).
+Iter3 fixes it at the source: move the capture of
+`cur_chkp_num` / `prev_chkp_num` from function entry (line 1196)
+to AFTER the sys-tree pre-loop, with a comment documenting the
+invariant so the next refactor doesn't re-introduce the race.
+Iter1 (idempotent guard) and iter2 (re-derive) remain in place
+as defensive safety belts.
+
+**Verified in Phoenix CI run `24601963787`:**
+```
+LOG: orioledb checkpoint 4 started
+LOG: seq_buf_open_file: create (1, 2) type=t num=4   <- num=4, not num=2
+LOG: seq_buf_open_file: create (1, 2) type=m num=4
+LOG: checkpoint_map_write_header: (1, 2) chkp=4 ...
+... (sys trees processed cleanly)
+LOG: orioledb checkpoint 4 complete
+LOG: OrioleDB: sync_lsn updated to 0/170BAD8 after checkpoint 4
+```
+
+Checkpoint 4 is now structurally correct and completes end-to-end.
+
+### 6.6.4c — User-table page version on post-crash read (NEW, found by 6.6.4b iter3)
+
+**Status:** Known issue in v0.1.0-alpha.4, blocks v0.2.0-beta.1.
+
+After Phase 6.6.4b iter3 resolves the checkpoint-4 init race, the
+6.6.4 crash E2E progresses to the SELECT post-restart, which now
+FATALs with:
+
+```
+FATAL: Page version 0 of OrioleDB cluster is not among supported
+       for conversion 1
+```
+
+emitted by a regular backend processing the `SELECT count(*) FROM
+crash_verify` query. The specific trigger: the end-of-recovery
+checkpoint (`orioledb checkpoint 4`) iterates sys trees but
+*skips* user trees whose descriptor has no `shared_root_info` and
+no `evicted_data` (see
+`check_tree_needs_checkpointing: skip (5, 16476) ...` LOG), so the
+user table's pages never got a fresh Plan E FPI on restart. The
+pre-crash FPIs are in PageServer from checkpoint 3, but something
+in the read path is seeing a zero-initialised page (version 0)
+and failing the page upgrade to the current version 1.
+
+**Probable cause.** Either (a) PageServer is returning a
+zero-filled page for a block that was never FPI'd on the pre-crash
+side (checkpoint 3's map file covered what was dirty; blocks
+allocated post-checkpoint-3 but pre-SIGKILL have no FPI), or (b)
+the per-page LSN tracking for user-table blocks diverges between
+the `wal_decoder` key space and the read path's
+`handle_get_page_request`. Needs another diagnostic pass.
+
+**Out of this session.** Phase 6.6.4c blocks `continue-on-error:
+false` flip and v0.2.0-beta.1. Phase 6.6.4b proper is done; 6.6.4c
+is its successor.
 
 **Release-gate consequence.** The Phoenix CI `serverless-e2e` job
 stays `continue-on-error: true` through v0.2.0-beta.1 because this
