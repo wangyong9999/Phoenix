@@ -1,8 +1,13 @@
-# OrioleDB Page-Level WAL: Implementation Plan
+# OrioleDB Page-Level WAL: Implementation Plan (ARCHIVED)
 
-> **Status:** Complete — Phase 1-5 implemented
+> ⚠️ **HISTORICAL / SUPERSEDED** ⚠️
+>
+> **Status (as originally claimed):** Complete — Phase 1-5 implemented
+> **Actual outcome:** Phase 1-4 骨架实现，Phase 5 (cleanup) 未完成。"Complete" 为过度乐观标记。
+> **Superseded by:** `../LOG_IS_DATA_ARCHITECTURE.md` (v2.1, commit-barrier 模式)
+> **Why superseded:** 本 plan 把 "per-mutation block-keyed eager WAL" 设为目标，推演出过重的 WAL 代价。v2.1 修正为 commit-barrier：只 commit 涉及的关键 block 入 WAL，非关键 block 继续 lazy flush。
 > **Created:** 2026-04-16
-> **Last updated:** 2026-04-16
+> **Archived:** 2026-04-18
 
 ## 1. Background & Motivation
 
