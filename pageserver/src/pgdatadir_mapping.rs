@@ -2399,6 +2399,28 @@ impl DatadirModification<'_> {
                 "invalid relnode"
             )))?;
         }
+        // Phase 6.6.4c: if this relation already exists, don't overwrite
+        // its rel_size with `nblocks` (which SMGR_CREATE passes as 0).
+        // OrioleDB emits SMGR_CREATE for its synthetic relations on every
+        // compute startup in orioledb_page_wal_register_tree (process-local
+        // registered_rels cache is reset per-process), so a stateless
+        // restart re-emits creation for already-populated relations. The
+        // reldir insert paths (put_rel_creation_v1 / _v2) are already
+        // idempotent, but the trailing `put(size_key, nblocks=0)` below
+        // effectively truncates the relation to 0 blocks — next read
+        // returns a zero page, which FATALs in OrioleDB's
+        // check_orioledb_page_version ("Page version 0 of OrioleDB
+        // cluster is not among supported for conversion 1").
+        //
+        // Skip the size write when the relation is already known to exist.
+        // This only affects re-creation of an existing rel; new creations
+        // (the normal SMGR_CREATE path) still write size=0 as before.
+        let rel_already_exists = self
+            .tline
+            .get_rel_exists(rel, Version::Modified(self), ctx)
+            .await
+            .unwrap_or(false);
+
         // It's possible that this is the first rel for this db in this
         // tablespace.  Create the reldir entry for it if so.
         let mut dbdir = DbDirectory::des(&self.get(DBDIR_KEY, ctx).await?)?;
@@ -2445,15 +2467,27 @@ impl DatadirModification<'_> {
             }
         }
 
-        // Put size
-        let size_key = rel_size_to_key(rel);
-        let buf = nblocks.to_le_bytes();
-        self.put(size_key, Value::Image(Bytes::from(buf.to_vec())));
+        // Put size — but only if this is a genuinely new creation.
+        // See the comment at the top of put_rel_creation for rationale:
+        // OrioleDB re-emits SMGR_CREATE for existing synthetic relations
+        // on every stateless restart, and writing nblocks=0 here would
+        // truncate the relation's PageServer view to zero blocks.
+        if !rel_already_exists {
+            let size_key = rel_size_to_key(rel);
+            let buf = nblocks.to_le_bytes();
+            self.put(size_key, Value::Image(Bytes::from(buf.to_vec())));
 
-        self.pending_nblocks += nblocks as i64;
+            self.pending_nblocks += nblocks as i64;
 
-        // Update relation size cache
-        self.tline.set_cached_rel_size(rel, self.lsn, nblocks);
+            // Update relation size cache
+            self.tline.set_cached_rel_size(rel, self.lsn, nblocks);
+        } else {
+            tracing::debug!(
+                "put_rel_creation: skipping size write for already-existing rel {:?} \
+                 (Phase 6.6.4c: OrioleDB re-emits SMGR_CREATE on stateless restart)",
+                rel
+            );
+        }
 
         // Even if nblocks > 0, we don't insert any actual blocks here. That's up to the
         // caller.
