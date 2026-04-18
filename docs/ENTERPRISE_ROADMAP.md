@@ -1,33 +1,326 @@
 # OrioleDB on Neon: Enterprise Readiness Roadmap
 
-> **Status:** POC validated — stateless restart works (100 rows recovered)
-> **Created:** 2026-04-16
-> **Baseline:** INSERT → CHECKPOINT → STOP → RESTART → SELECT = 100 rows ✅
+> **Status:** v0.1.0-alpha.2 cut on commit `8955a03` (2026-04-17) — Phase 6
+> and Phase 6.5 verified under Phoenix CI `24561080441` with `serverless-e2e`
+> actually green (not masked by `continue-on-error`).
+> **Created:** 2026-04-16, last updated 2026-04-18
+> **Baseline:** INSERT 100 rows → CHECKPOINT → STOP → RESTART → SELECT,
+> md5 checksum preserved end-to-end.
 
-## Phase 6: Delta WAL Recovery (CRITICAL)
+## Guiding Principles
 
-**Goal:** Verify data recovery for non-checkpointed modifications
+Two invariants every phase below must respect. Any design that violates
+them is rejected regardless of how quickly it unblocks a specific test.
 
-**Test:** INSERT → CHECKPOINT → INSERT more → STOP (no 2nd CHECKPOINT) → RESTART → SELECT
+1. **Log-is-Data.** WAL is the single source of persistence truth. Local
+   filesystem state on the compute node is a *cache*, never an authority.
+   Any compute node, starting fresh from WAL + PageServer, must converge
+   to the same state as the compute that wrote it.
 
-This exercises the complete page-level delta WAL → wal-redo pipeline:
-  PageServer finds: base image (checkpoint FPI) + delta (LEAF_INSERT WAL)
-  → sends both to wal-redo process
-  → orioledb_page_redo applies delta to base image
-  → returns correct page with both checkpoint and post-checkpoint data
+2. **Serverless weight ≤ Neon + PG heap.** Each added mechanism must be
+   quantified against the equivalent PG heap path on Neon. If the delta
+   is positive (more bytes on the wire, more disk syncs, more RTTs per
+   op), the mechanism does not ship as-is. "OrioleDB is different" is
+   not an excuse — the overhead delta must be justified by feature
+   delta, not absorbed silently.
 
-**If fails:** Fall back to FPI-only mode (change delta to FPI for all ops)
+Write-path comparison reference (kept up to date as design evolves):
 
-## Phase 6.5: Sys-tree descriptor lifecycle on stateless restart
+| Step | PG heap on Neon | OrioleDB (target, after Phase 6.6) |
+|---|---|---|
+| backend | XLogInsert + MarkBufferDirty | XLogInsert + in-mem buffer write (no fsync) |
+| flush | FlushBuffer → smgr → network | buffer flush → local FS (cache only) |
+| read miss | smgr → network get_page | local FS cache → on miss → smgr → network |
 
-> **Status:** Candidate fix in flight — commit `1684e2e` hoists the
-> deferred control-file load out of `checkpointable_tree_init` into
-> `sys_tree_init_if_needed`. Verification pending CI run
-> `24560180590`. If E2E reaches `[9/9] PASS`, close this phase and
-> cut v0.1.0-alpha.2 per the Release Gate.
+Target: OrioleDB write ≤ PG heap write (avoids network on flush).
+Read: OrioleDB cache-hit is *faster* than PG heap (no RTT); cache-miss
+is one extra local read, then identical.
 
-**Symptom** observed in Phoenix CI run `24558882594` (step 7,
-fresh backend after stateless restart):
+---
+
+## Phase 6.5: Sys-tree descriptor lifecycle — RESOLVED
+
+> **Status:** Resolved in v0.1.0-alpha.2 (commit `8955a03`). Two-part fix:
+> `1684e2e` (hoist deferred control-file load out of
+> `checkpointable_tree_init`) + `8955a03` (propagate `chkp_num` after
+> Plan E map rehydrate). Phoenix CI run `24561080441` passes
+> `serverless-e2e` on its own merits.
+>
+> Root-cause write-up preserved at the bottom of this file for future
+> readers debugging similar sys-tree ordering bugs.
+
+## Phase 6: Delta WAL Recovery — VERIFIED
+
+> **Status:** Verified 2026-04-17 under CI `24561080441`. INSERT →
+> CHECKPOINT → INSERT more → STOP → RESTART → SELECT produces the full
+> post-checkpoint row set via wal-redo applied to checkpoint FPI.
+> Preserved here as a reference phase, not an open item.
+
+---
+
+## Phase 6.6: Log-is-Data completeness (P0, blocks beta)
+
+**Thesis.** Today's OrioleDB integration is a *hybrid*: local files are
+written first, then mirrored to WAL. That leaves two failure modes — a
+crash mid-write produces a local file that is newer than WAL (corrupt on
+recovery), and a branch/PITR operation sees inconsistent state because
+local files are not timeline-aware. Fix by making WAL the only authority
+and demoting local FS to cache.
+
+Phase 6.6 has five sub-items, deliberately ordered so the cheapest
+read-only audits (`6.6.0`, `6.6.3`) run first and may shrink the
+expensive write-path work (`6.6.2`).
+
+### 6.6.0 — Basebackup semantic audit (read-only)
+
+**Question.** When `get_basebackup(LSN)` is invoked on stateless
+restart, does the returned tar already contain `orioledb_data/`
+contents sourced from PageServer? Or is `orioledb_data/` empty and
+relies on Plan E FPI replay to populate?
+
+**Why this matters.** If basebackup already covers OrioleDB files,
+Plan B's undo/xidmap mirror is a belt-and-suspenders mechanism and
+6.6.2's WAL-then-FS rewrite can collapse into "confirm invariants +
+add asserts" — massively smaller blast radius. If basebackup does
+*not* cover them, 6.6.2 must do the full write-path inversion.
+
+**Deliverable.** `docs/BASEBACKUP_AUDIT.md`: file paths + quoted code
+from `pageserver/src/basebackup.rs` and `compute_tools/src/compute.rs`,
+plus a one-line conclusion. No code changes in this step.
+
+**Exit criterion.** 6.6.2's scope is either "shrunk" or "confirmed
+full-scope" before any write-path code is touched.
+
+### 6.6.1 — dbOid / relNumber alignment
+
+**Current state.** `o_buffers.c:239,285` and `checkpoint.c:2961`
+hard-code `dbOid = 0` for synthetic relations (undo log 1, xidmap 2,
+checkpoint map files). This collides across databases the moment
+OrioleDB is installed in more than one database in a tenant.
+
+**Target.** Synthetic relation OIDs drawn from a reserved range that
+does not collide with PG system catalog OID allocation and is
+tenant/timeline-namespaced at the PageServer key layer, matching how
+Neon's other synthetic relations (SLRU mirrors) are keyed today.
+
+**Scope.** Read neon's SLRU mirroring code for the precedent. Update
+`pgxn/orioledb/src/utils/o_buffers.c`, `transam/undo.c`,
+`transam/oxid.c`, `checkpoint.c` to draw OIDs from that range. Add a
+regression test with two databases both using `CREATE EXTENSION
+orioledb`.
+
+**Exit criterion.** Two databases in a tenant both running OrioleDB
+writes and reads correctly survive stateless restart independently.
+
+### 6.6.2 — WAL-then-FS write path (scope TBD by 6.6.0)
+
+**If 6.6.0 shows basebackup already covers `orioledb_data/`:**
+reduce to confirm-and-assert — add runtime asserts that Plan B mirror
+records are only a redundant consistency check, documented clearly,
+and remove the `checkpoint_is_shutdown` carve-out on the write side
+(it becomes moot).
+
+**If 6.6.0 shows basebackup does not cover it:**
+invert write path. `write_buffer_data` emits `XLogInsert` first; the
+local FS write is downgraded to a buffered cache flush (no fsync on
+the OrioleDB buffer boundary — WAL fsync at commit is still
+authoritative). Crash-mid-write leaves a local file in any state, and
+recovery ignores it: WAL replay rebuilds the buffer from the
+authoritative FPI sequence.
+
+**Weight guard.** Benchmark WAL bytes/sec and end-to-end INSERT
+latency against the pre-6.6.2 baseline. If writes go up by more than
+10% (measured under the `test_e2e_crud.sh` workload), the design
+needs revision before merge.
+
+**Exit criterion.** Benchmark shows write latency ≤ pre-6.6.2
+baseline; 6.6.4 E2E gate passes.
+
+### 6.6.3 — Page LSN external tracking (read-only + unit test)
+
+**Claim under test.** `wal_decoder` keys rmid=129 FPI records by
+`(spc, db, rel, block, lsn)` and PageServer's cache layer indexes
+them by the same tuple — OrioleDB page header's lack of `pd_lsn` is
+not a correctness problem, only a layout difference.
+
+**Deliverable.** One `wal_decoder` unit test that constructs an
+OrioleDB FPI record, runs it through the decoder, and asserts the
+resulting `Key` includes the correct LSN outside the page bytes. If
+the test cannot be written (because decoding currently depends on
+pd_lsn), that in itself is the finding and 6.6.3 expands.
+
+**CSN collision note.** OrioleDB's `chkp_num` has "page version"
+semantics but is **not** a substitute for LSN (chkp_num is
+per-checkpoint-epoch monotonic; LSN is per-WAL-byte). Recovery must
+apply physical WAL in LSN order, then filter by chkp_num for
+visibility. No design change here — just a documented invariant so
+future readers do not conflate them.
+
+**Exit criterion.** Unit test green; invariant documented.
+
+### 6.6.4 — Release gate: crash-mid-checkpoint E2E
+
+**Test.** `scripts/test_e2e_crash_mid_ckpt.sh`: start cluster,
+INSERT 5000 rows, `CHECKPOINT` + immediate `kill -9` on the compute
+PID, restart, SELECT count + md5 — must match pre-kill state.
+
+**Gate.** This E2E becomes a required check on `phoenix-ci.yml`
+(not continue-on-error) before Phase 6.6 is declared done.
+
+**Exit criterion.** 10 consecutive green runs on `main` before tag.
+
+---
+
+## Phase 6.7: Branching + PITR — verification, not design (P1)
+
+**Thesis.** If 6.6.0/6.6.1/6.6.2 are correct, PageServer's existing
+timeline COW and LSN-point recovery apply to rmid=129 records the
+same way they apply to PG heap. 6.7 is a *verification* phase —
+any failure reverts to 6.6 as a scope gap, not patched over here.
+
+### 6.7.1 — Branching
+
+- `cargo neon timeline branch` from a checkpoint LSN
+- Reconnect to the branch, `SELECT * FROM orioledb_table` must match
+  the parent's content at branch LSN
+- Write diverging data on parent and branch — verify isolation
+
+### 6.7.2 — PITR
+
+- INSERT 1000 rows at LSN A, 1000 more at LSN B, CHECKPOINT after
+- Create a PITR endpoint at LSN A; verify row count = 1000, not 2000
+- Create at LSN B; verify row count = 2000
+
+**Exit criterion.** Both tests green without any OrioleDB-specific
+branching/PITR code — the whole point is that 6.6 should have made
+them fall out of existing Neon machinery.
+
+---
+
+## Phase 6.8: Replication (P1)
+
+### 6.8.1 — Physical replication (OrioleDB primary → OrioleDB standby)
+
+Neon's safekeeper streams rmid=129 to a standby compute; standby
+wal-redo applies records in order. Verify failover preserves data.
+No WAL format changes — this should work after 6.6.
+
+### 6.8.2 — Logical decoding plugin (lower priority, independent work)
+
+**Clarification of earlier sloppy phrasing.** rmid=129 *already*
+contains two record classes in a single stream: page-delta (Plan E
+FPI, LEAF/NON_LEAF structural) and row-level
+(`LEAF_INSERT/UPDATE/DELETE`). The plugin only changes the *consumer*
+side — it does not double the WAL on the writer side. No extra WAL
+bytes.
+
+**Scope.** Write `orioledboutput` output plugin that subscribes to
+rmid=129 logical records and emits Debezium-compatible row events.
+Ship as a separate `.so` loaded via `CREATE_LOGICAL_REPLICATION_SLOT`.
+
+---
+
+## Phase 7: Test matrix alignment with PG + Neon (P1)
+
+**Thesis.** First-commercial readiness = OrioleDB-on-Neon passes the
+union of PG-heap-on-Neon tests and OrioleDB-standalone tests. Neither
+subset alone is sufficient.
+
+### 7.1 — OrioleDB standalone regression under Neon mode
+
+`pgxn/orioledb/test/sql/` has 43+ SQL tests that assume local-FS
+persistence. Add a Neon-mode variant for each: after the main test
+body, stateless-restart the compute, re-run the SELECT portion, and
+assert identical output.
+
+**Tooling.** `scripts/run_orioledb_tests_neon.sh` wraps each test file.
+Add to `phoenix-ci.yml` as a new matrix job.
+
+### 7.2 — Neon `test_runner/` OrioleDB variants
+
+For each PG-heap test in `test_runner/regress_tests/` covering:
+`restart`, `branching`, `pitr`, `checkpoint`, `crash_during_*` —
+add a `_orioledb` sibling that uses `USING orioledb` tables and the
+same assertions.
+
+### 7.3 — CRUD + concurrency + crash E2E (was the old Phase 7)
+
+- `test_e2e_crud.sh` — UPDATE 50 / DELETE 50 / INSERT 5000 (SPLIT) / mixed
+- `test_e2e_concurrent.sh` — 2 backends concurrent INSERT → restart
+- `test_e2e_crash.sh` — SIGKILL in CHECKPOINT → restart (same as 6.6.4)
+
+---
+
+## Known non-blocking gaps
+
+Tracked but not on the first-commercial critical path. Revisit after
+Phase 7 exit.
+
+- Partitioned tables (OrioleDB AM doesn't support partitioning)
+- TOAST compression specifics + out-of-line storage
+- Non-default tablespaces (OrioleDB hard-codes `DEFAULTTABLESPACE_OID`)
+- Undo / xidmap garbage collection (long-running clusters grow unbounded)
+- Plan E FPI volume throttling (bulk load emits one FPI per touched page)
+- `walredoproc.c` `EndRedoForBlock` stub (currently delegates to PG core;
+  unclear if stateless teardown path is fully correct)
+- Vendor PG assert diff vs upstream — no evidence asserts are relaxed in
+  release builds, but the subtree merge has not been audited against
+  REL_17_STABLE
+
+---
+
+## Priority Order
+
+Reflecting the "minimum-verified-loop" discipline: cheapest read-only
+audits first, then write-path changes that depend on their findings,
+then test matrix buildout.
+
+1. **6.6.0 + 6.6.3** — parallel read-only audits
+2. **6.6.1** — dbOid alignment (small blast radius, broad impact)
+3. **6.6.2** — WAL-then-FS (scope determined by 6.6.0)
+4. **6.6.4** — crash-mid-ckpt gate
+5. **6.7.1 + 6.7.2** — branching + PITR verification
+6. **6.8.1** — physical replication verification
+7. **7.1 + 7.2 + 7.3** — test matrix
+8. **6.8.2** — logical decoding plugin (parallel-safe, lower priority)
+
+## Release Gate
+
+Release tags (`vX.Y.Z-alpha.N`, `-beta.N`, `-rc.N`) are only cut when:
+
+1. Phoenix CI run for the tag commit is **fully green** on every job
+   that is not `continue-on-error`. From v0.2.0-beta.1 onward,
+   `serverless-e2e` must be `continue-on-error: false`. Until that
+   cutover, the scaffold stays to absorb 6.6 write-path churn, but
+   the tag commit must still see the job as green.
+2. `scripts/test_e2e.sh` + all 6.6.4-era E2E scripts reach PASS with
+   matching row counts + md5 across the full restart cycle (including
+   mid-checkpoint crash).
+3. Release notes enumerate `Verified` vs `Known limitations` by phase
+   number, not hand-waving.
+4. No open `P0` task at the release commit.
+5. Weight-guard benchmark from 6.6.2 is attached to the release PR
+   and shows write latency ≤ the prior tag's baseline.
+
+`v0.1.0-alpha.1` was cut before this gate existed. `v0.1.0-alpha.2`
+meets criteria 1–4 but predates the weight-guard benchmark requirement
+(criterion 5), which applies from `v0.2.0-beta.1` onward.
+
+**Release milestones:**
+
+- `v0.1.0-alpha.2` — 100-row round-trip + sys-tree lifecycle fix (shipped)
+- `v0.2.0-beta.1` — Phase 6.6 complete, `serverless-e2e` a hard gate
+- `v0.3.0-beta.1` — Phase 6.7 + 6.8.1 verified
+- `v1.0.0-rc.1` — Phase 7.1 + 7.2 at ≥80% parity with PG-heap-on-Neon
+
+---
+
+## Appendix A: Phase 6.5 root-cause write-up (historical)
+
+Preserved for future readers debugging similar sys-tree ordering bugs.
+
+**Symptom** observed in Phoenix CI run `24558882594` (step 7, fresh
+backend after stateless restart):
 
 ```
 TRAP: failed Assert("OInMemoryBlknoIsValid((td)->rootInfo.metaPageBlkno)"),
@@ -38,110 +331,28 @@ autovacuum launcher → GetSnapshotData → orioledb snapshot hook
                     → BTREE_GET_META(td)   [metaPageBlkno invalid]
 ```
 
-**State at crash:**
-
-- Startup process successfully loaded control file from PageServer,
-  reset the 24 sys-tree `initialized` flags via
-  `sys_trees_reset_initialized()`, ran end-of-recovery checkpoint 3,
-  emitted map-file + data-page + control-file FPIs, updated
-  `sync_lsn`.
-- First fresh backend after PG reached "accepting connections"
-  (autovacuum launcher) hit the OrioleDB snapshot hook and tripped
-  the assert initializing sys tree `(1, 2)` with `chkp_num=3`.
-
-**Actual root cause (identified 2026-04-17):** Not the hypothesis
-above — the fault is specifically in the *timing* of
-`sys_trees_reset_initialized()`. The old code called it from inside
-`checkpointable_tree_init`, which in turn is called from the middle
-of `sys_tree_init(i, init_shmem=true)`. By the time the reset runs,
-`sys_tree_init` has already written the freshly allocated
+**Actual root cause (identified 2026-04-17):** The fault is specifically
+in the *timing* of `sys_trees_reset_initialized()`. The old code called
+it from inside `checkpointable_tree_init`, which is called from the
+middle of `sys_tree_init(i, init_shmem=true)`. By the time the reset
+runs, `sys_tree_init` has already written the freshly allocated
 `metaPageBlkno` into `sysTreesShmemHeaders[i].rootInfo`. The reset
-nukes it, the caller returns unaware, and
-`sys_tree_init_if_needed` then sets
-`header[i].initialized = true`. Header `i` is now permanently in a
-`{initialized=true, metaPageBlkno=invalid}` state. The next fresh
-backend (a process where `sysTreesDescrs[i].initialized=false`
-locally) reads `header[i]`, sees `initialized=true`, takes the
-`sys_tree_init(i, init_shmem=false)` branch, copies the invalid
-`metaPageBlkno` into its local descriptor, and the next
-`BTREE_GET_META(td)` dereference trips the assert.
+nukes it, the caller returns unaware, and `sys_tree_init_if_needed`
+then sets `header[i].initialized = true`. Header `i` is now
+permanently in a `{initialized=true, metaPageBlkno=invalid}` state.
+The next fresh backend reads `header[i]`, sees `initialized=true`,
+takes the `sys_tree_init(i, init_shmem=false)` branch, copies the
+invalid `metaPageBlkno`, and the next `BTREE_GET_META(td)` trips the
+assert.
 
-Trees `i=0, i=2..23` escape the trap: `i=0` is `BTreeStorageInMemory`
-(skips the path entirely), and `i=2..23` see `lastCheckpointNumber
-!= 0` so the deferred-load branch no longer fires for them. Only
-`i=1` — sys tree `(1, 2)` — is left poisoned, matching the crash
-address.
+Trees `i=0, i=2..23` escape: `i=0` is `BTreeStorageInMemory`, `i=2..23`
+see `lastCheckpointNumber != 0` and skip the deferred-load branch.
+Only `i=1` — sys tree `(1, 2)` — is poisoned.
 
-**Not a workaround candidate.** Disabling autovacuum or
-max_worker_processes just delays the crash until the first real
-user backend. The architectural fix must restore sys-tree
-shared-memory state cleanly after `sys_trees_reset_initialized()`,
-or skip the reset when `lastCheckpointNumber` is already non-zero
-and the control file contents are coherent.
-
-**Fix applied (`1684e2e`):** Move the deferred control file load
-into a new `sys_trees_load_control_if_deferred()` helper and call
-it at the very top of `sys_tree_init_if_needed`, before the per-tree
-alloc loop starts handing out `metaPageBlkno` pages. The reset now
-runs while all headers are still in their initial-shmem invalid
-state, so the alloc loop hands out fresh pages cleanly and no
-header ends up half-initialized. The old call site inside
-`checkpointable_tree_init` is removed; a comment there records why
-and points readers to the new helper.
-
-## Phase 7: Full CRUD + Structural Operations
-
-**Tests:**
-- UPDATE 50 rows → CHECKPOINT → STOP → RESTART → verify updates present
-- DELETE 50 rows → CHECKPOINT → STOP → RESTART → verify deletions
-- INSERT 5000 rows (trigger multiple SPLITs) → CHECKPOINT → RESTART → verify all
-- Mixed operations → RESTART → verify
-
-## Phase 8: Branching
-
-**Test:** INSERT data → create timeline branch → SELECT on branch
-- Verifies OrioleDB page-level WAL supports Neon's branching
-- Tests ancestor timeline page resolution for OrioleDB synthetic relations
-
-## Phase 9: Stress & Reliability
-
-**Tests:**
-- pgbench with OrioleDB tables (1000 TPS for 60s → restart → verify)
-- WAL volume measurement (delta vs FPI overhead)
-- Concurrent INSERT from multiple backends → crash → restart
-
-## Phase 10: CSN Improvement
-
-- Verify xidBuffer checkpoint flush covers all committed CSN
-- Test transaction visibility after restart (CSN-based MVCC)
-- Evaluate: commit-time flush vs checkpoint-only flush
-
-## Priority Order
-
-1. **Phase 6.5 (sys-tree descriptor lifecycle)** — blocks `serverless-e2e` CI green; must be real fix, no workaround
-2. Phase 6 (delta WAL) — covers post-checkpoint recovery
-3. Phase 7 (CRUD) — confidence in basic operations
-4. Phase 8 (branching) — Neon's value proposition
-5. Phase 9 (stress) — production readiness
-6. Phase 10 (CSN) — completeness
-
-## Release Gate
-
-Release tags (`vX.Y.Z-alpha.N`) are only cut when:
-
-1. Phoenix CI run for the tag commit is **fully green**, including
-   the `serverless-e2e (Plan E round-trip)` job. `continue-on-error`
-   on that job is a temporary scaffold for infrastructure bring-up,
-   **not** a release gate — the job must actually pass.
-2. `scripts/test_e2e.sh` reaches `[9/9] PASS — OrioleDB serverless
-   round-trip verified` with matching row count + md5 checksum
-   across the stop/start cycle.
-3. Release notes honestly enumerate what works (`Verified`) vs what
-   is deferred (`Known limitations`). Reference roadmap phase
-   numbers rather than hand-waving.
-4. No open `P0` items in the task tracker at the release commit.
-
-`v0.1.0-alpha.1` was cut before this gate existed and shipped with
-a failing `serverless-e2e` job masked by `continue-on-error`. It
-is preserved as a historical baseline; future alphas follow this
-gate.
+**Fix applied (`1684e2e` + `8955a03`):** Hoist deferred control-file
+load into `sys_trees_load_control_if_deferred()`, called at the top
+of `sys_tree_init_if_needed` before the per-tree alloc loop. The
+reset runs while all headers are still in their initial-shmem
+invalid state, so the alloc loop hands out fresh pages cleanly.
+`8955a03` additionally propagates the freshly-loaded `chkp_num` so
+the post-rehydrate init path uses the correct epoch.
