@@ -71,25 +71,20 @@ Phase 6.6 has five sub-items, deliberately ordered so the cheapest
 read-only audits (`6.6.0`, `6.6.3`) run first and may shrink the
 expensive write-path work (`6.6.2`).
 
-### 6.6.0 — Basebackup semantic audit (read-only)
+### 6.6.0 — Basebackup semantic audit (read-only) — COMPLETE
 
-**Question.** When `get_basebackup(LSN)` is invoked on stateless
-restart, does the returned tar already contain `orioledb_data/`
-contents sourced from PageServer? Or is `orioledb_data/` empty and
-relies on Plan E FPI replay to populate?
-
-**Why this matters.** If basebackup already covers OrioleDB files,
-Plan B's undo/xidmap mirror is a belt-and-suspenders mechanism and
-6.6.2's WAL-then-FS rewrite can collapse into "confirm invariants +
-add asserts" — massively smaller blast radius. If basebackup does
-*not* cover them, 6.6.2 must do the full write-path inversion.
-
-**Deliverable.** `docs/BASEBACKUP_AUDIT.md`: file paths + quoted code
-from `pageserver/src/basebackup.rs` and `compute_tools/src/compute.rs`,
-plus a one-line conclusion. No code changes in this step.
-
-**Exit criterion.** 6.6.2's scope is either "shrunk" or "confirmed
-full-scope" before any write-path code is touched.
+> **Status:** Done 2026-04-18. Finding: **Possibility B** —
+> basebackup does NOT include `orioledb_data/`. Plan B WAL mirror is
+> the sole durability layer, not belt-and-suspenders. Full audit with
+> quoted code at `docs/BASEBACKUP_AUDIT.md`.
+>
+> **Consequence.** 6.6.2 scope is locked at **full**: write-path
+> inversion (XLogInsert first, local FS demoted to cache) is
+> mandatory. Two concrete issues to close:
+>   1. `o_buffers.c:214-254` writes FS *before* WAL — ordering must
+>      invert.
+>   2. `o_buffers.c:233` `checkpoint_is_shutdown` skip on Plan B
+>      mirror must be removed.
 
 ### 6.6.1 — dbOid / relNumber alignment
 
@@ -112,21 +107,22 @@ orioledb`.
 **Exit criterion.** Two databases in a tenant both running OrioleDB
 writes and reads correctly survive stateless restart independently.
 
-### 6.6.2 — WAL-then-FS write path (scope TBD by 6.6.0)
+### 6.6.2 — WAL-then-FS write path (full scope, locked by 6.6.0)
 
-**If 6.6.0 shows basebackup already covers `orioledb_data/`:**
-reduce to confirm-and-assert — add runtime asserts that Plan B mirror
-records are only a redundant consistency check, documented clearly,
-and remove the `checkpoint_is_shutdown` carve-out on the write side
-(it becomes moot).
+6.6.0 confirmed basebackup does not cover `orioledb_data/`. Scope is
+the full write-path inversion:
 
-**If 6.6.0 shows basebackup does not cover it:**
-invert write path. `write_buffer_data` emits `XLogInsert` first; the
-local FS write is downgraded to a buffered cache flush (no fsync on
-the OrioleDB buffer boundary — WAL fsync at commit is still
-authoritative). Crash-mid-write leaves a local file in any state, and
-recovery ignores it: WAL replay rebuilds the buffer from the
-authoritative FPI sequence.
+- `write_buffer_data` (`o_buffers.c:214-254`) emits `XLogInsert` first;
+  the local FS write is downgraded to a buffered cache flush (no fsync
+  on the OrioleDB buffer boundary — WAL fsync at commit is still
+  authoritative). Crash-mid-write leaves a local file in any state,
+  and recovery ignores it: WAL replay rebuilds the buffer from the
+  authoritative FPI sequence.
+- Remove the `checkpoint_is_shutdown` skip on Plan B mirror
+  (`o_buffers.c:233`). Under WAL-then-FS, shutdown checkpoints have
+  no reason to bypass WAL.
+- Add a write-path assert: every non-empty local buffer write is
+  preceded by a successful `XLogInsert` returning a valid LSN.
 
 **Weight guard.** Benchmark WAL bytes/sec and end-to-end INSERT
 latency against the pre-6.6.2 baseline. If writes go up by more than
