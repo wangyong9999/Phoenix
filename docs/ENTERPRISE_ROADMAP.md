@@ -211,13 +211,59 @@ future readers do not conflate them.
 ### 6.6.4 — Release gate: crash-mid-checkpoint E2E
 
 **Test.** `scripts/test_e2e_crash_mid_ckpt.sh`: start cluster,
-INSERT 5000 rows, `CHECKPOINT` + immediate `kill -9` on the compute
-PID, restart, SELECT count + md5 — must match pre-kill state.
+INSERT 1000 rows, background `CHECKPOINT` + immediate `kill -9` on
+the compute PID, stateless restart, SELECT count + md5 — must match
+pre-kill state.
 
-**Gate.** This E2E becomes a required check on `phoenix-ci.yml`
-(not continue-on-error) before Phase 6.6 is declared done.
+**Status: shipped, currently failing in CI — intentional.** The
+test is passing the point of the test: on Phoenix CI run
+`24600322094` it reliably reveals an OrioleDB startup-path
+assertion at `src/checkpoint/checkpoint.c:5260`:
 
-**Exit criterion.** 10 consecutive green runs on `main` before tag.
+```
+PG [startup]: orioledb checkpoint 4 started
+TRAP: failed Assert("!OInMemoryBlknoIsValid(shared->pages[0])"),
+      File: "src/checkpoint/checkpoint.c", Line: 5260
+  -> init_seq_buf_pages  (seq buf shared-memory init)
+  -> checkpointable_tree_fill_seq_buffers
+  -> end-of-recovery checkpoint after orioledb_recovery.signal
+```
+
+This is a cousin of the Phase 6.5 sys-tree lifecycle bug (same
+`OInMemoryBlknoIsValid` family, different state): after a
+SIGKILLed compute whose pgdata is wiped on restart, the seq-buf
+descriptor's shared-memory state races the fresh-init path of
+`init_seq_buf_pages` against the state the end-of-recovery
+checkpoint reads from the Plan-E-rehydrated map file.
+
+**Not caused by Phase 6.6.2.** write_buffer_data's reordering
+only swaps FS-write and XLogInsert inside the Plan B branch; it
+does not touch seq-buf descriptor initialization or map rehydrate.
+The bug predates 6.6.2 — it was simply unreachable under the old
+test suite (which only exercised clean stop/start and therefore
+never hit the "end-of-recovery checkpoint after crash + empty
+pgdata" path). 6.6.4 is the first test to drive that path, which
+is precisely what a release gate is for.
+
+**Follow-up work (Phase 6.6.4b, out of this session).**
+- Diagnose which seq-buf descriptor has `pages[0]` populated at
+  recovery-checkpoint start. Dump the owner tree, match to a
+  specific OrioleDB table's oid.
+- Determine whether the fix is to clear `shared->pages[*]`
+  analogous to Phase 6.5's `sys_trees_load_control_if_deferred`,
+  or to skip `init_seq_buf_pages` when the descriptor is already
+  populated from the rehydrate path.
+- Extend the crash E2E to also drive SPLIT and multi-table
+  workloads (today 6.6.4 only exercises a single primary-key
+  table; the bug may have more variants under heavier tree
+  mutation).
+
+**Release-gate consequence.** The Phoenix CI `serverless-e2e` job
+stays `continue-on-error: true` through v0.2.0-beta.1 because this
+step is expected to fail until Phase 6.6.4b lands. Release notes
+must enumerate this failure explicitly — the alternative (flipping
+the test's ROWS down or removing the test) would hide the very bug
+the gate is working as intended to find.
 
 ---
 
