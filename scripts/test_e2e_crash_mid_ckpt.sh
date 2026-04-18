@@ -196,8 +196,26 @@ echo "  compute pid $PID SIGKILLed mid-checkpoint"
 cargo neon endpoint stop "$ENDPOINT_NAME" >/dev/null 2>&1 || true
 sleep 2
 
+# True stateless restart semantics: discard the compute-local pgdata
+# (it may be in a half-checkpoint-applied state after SIGKILL) so
+# the restart has to rebuild from basebackup + WAL replay. This is
+# precisely the "Log-is-Data" recovery path the gate is testing —
+# if any OrioleDB state survived only in the local FS, dropping
+# pgdata will expose it as md5 divergence after restart.
+PGDATA_DIR=".neon/endpoints/$ENDPOINT_NAME/pgdata"
+if [ -d "$PGDATA_DIR" ]; then
+    echo "  wiping $PGDATA_DIR to force fresh basebackup on restart"
+    rm -rf "$PGDATA_DIR"
+fi
+
 section "[7/10] Stateless restart after crash"
-cargo neon endpoint start "$ENDPOINT_NAME"
+# Verbose stderr so any cargo neon / compute_ctl failure is visible
+# in the CI log (the earlier opaque exit-1 cost one CI round).
+cargo neon endpoint start "$ENDPOINT_NAME" || {
+    echo "FAIL: cargo neon endpoint start returned non-zero after crash" >&2
+    echo "      The stateless-restart path couldn't recover from a mid-CHECKPOINT SIGKILL." >&2
+    exit 1
+}
 wait_for_psql "$COMPUTE_PORT"
 
 section "[8/10] Reconnect and read the table"
