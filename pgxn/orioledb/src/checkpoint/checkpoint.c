@@ -1592,10 +1592,38 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 	BTreeMetaPage *meta_page = BTREE_GET_META(descr);
 	Oid			datoid = descr->oids.datoid;
 	Oid			relnode = descr->oids.relnode;
-	int			next_chkp_index = (chkpNum + 1) % 2;
+	int			next_chkp_index;
+	int			live_chkp_num;
 	SeqBufTag	next_chkp_tag = {0},
 				next_tmp_tag = {0};
 	bool		success;
+
+	/*
+	 * Phase 6.6.4b: re-derive chkpNum from the live checkpoint_state rather
+	 * than trust the parameter. CI run 24601289309 showed the caller's
+	 * captured cur_chkp_num can be stale (1 instead of 4) even immediately
+	 * after o_perform_checkpoint emits "checkpoint N started" with the
+	 * correct lastCheckpointNumber. A stale chkpNum produces the wrong
+	 * next_chkp_index and re-initialises the same slot ckpt_fill just
+	 * populated — tripping the old Assert at src/checkpoint/checkpoint.c:5260
+	 * (since addressed by the idempotent guard in init_seq_buf_pages) and a
+	 * downstream Assert at src/utils/seq_buf.c:148 on a tag.type=0 read.
+	 *
+	 * By re-reading lastCheckpointNumber here and preferring the strictly
+	 * larger of {parameter, live}, we stay correct under both the pre-crash
+	 * path (where the parameter is accurate) and the post-crash path (where
+	 * the parameter is stale but the global is authoritative).
+	 */
+	live_chkp_num = checkpoint_state->lastCheckpointNumber + 1;
+	if (live_chkp_num > chkpNum)
+	{
+		elog(DEBUG1, "ckpt_init_new: (%u,%u) chkpNum parameter=%d is stale, "
+			 "using live lastCheckpointNumber+1=%d",
+			 descr->oids.datoid, descr->oids.relnode,
+			 chkpNum, live_chkp_num);
+		chkpNum = live_chkp_num;
+	}
+	next_chkp_index = (chkpNum + 1) % 2;
 
 	if (orioledb_s3_mode)
 	{
