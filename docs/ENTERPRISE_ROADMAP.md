@@ -319,20 +319,28 @@ Phase 7 exit.
 
 ---
 
-## Priority Order
+## Priority Order + current status
 
 Reflecting the "minimum-verified-loop" discipline: cheapest read-only
 audits first, then write-path changes that depend on their findings,
 then test matrix buildout.
 
-1. **6.6.0 + 6.6.3** — parallel read-only audits
-2. **6.6.1** — dbOid alignment (small blast radius, broad impact)
-3. **6.6.2** — WAL-then-FS (scope determined by 6.6.0)
-4. **6.6.4** — crash-mid-ckpt gate
-5. **6.7.1 + 6.7.2** — branching + PITR verification
-6. **6.8.1** — physical replication verification
-7. **7.1 + 7.2 + 7.3** — test matrix
-8. **6.8.2** — logical decoding plugin (parallel-safe, lower priority)
+| # | Phase | Status | Commit |
+|---|---|---|---|
+| 1 | **6.6.0** basebackup audit | ✅ DONE | `92eeb94` |
+| 1 | **6.6.3** LSN externality verification | ✅ DONE | `ab7e9f7` |
+| 2 | **6.6.1** synthetic OID hardening | ✅ DONE | `5d893a2` |
+| 3 | **6.6.2** WAL-then-FS reordering | ✅ DONE | `b2ebcb0` |
+| 4 | **6.6.4** crash-mid-ckpt E2E gate | ✅ DONE | `557f109` |
+| 5 | **6.7.1 + 6.7.2** branching + PITR verification | 🔷 scaffold | `49bf78d` |
+| 6 | **6.8.1** physical replication verification | 🔷 scaffold | `49bf78d` |
+| 7 | **7.1 + 7.2 + 7.3** test matrix | 🔷 scaffold | `49bf78d` |
+| 8 | **6.8.2** logical decoding plugin | 📝 spec only | `49bf78d` |
+
+**Legend.**
+- ✅ **DONE** — code + tests committed, build verified locally, CI expected to exercise on next push.
+- 🔷 **scaffold** — runnable script committed; exits 77 (skip) today until the corresponding `neon_local` subcommand is stable. Pending a live-stack validation run before the phase can be declared closed.
+- 📝 **spec only** — design/specification document committed; implementation is out-of-session work that must preserve the stated invariants (no double-emit, pure consumer).
 
 ## Release Gate
 
