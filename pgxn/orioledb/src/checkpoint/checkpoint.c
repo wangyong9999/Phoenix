@@ -1193,8 +1193,19 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	CheckpointTablesArg chkp_tbl_arg;
 	CheckpointControl control;
 	int			old_enable_stopevents;
-	uint32		cur_chkp_num = checkpoint_state->lastCheckpointNumber + 1,
-				prev_chkp_num = checkpoint_state->lastCheckpointNumber;
+	/*
+	 * Phase 6.6.4b: cur_chkp_num and prev_chkp_num are deliberately NOT
+	 * initialised here. They are captured *after* the sys-tree pre-loop
+	 * below, because sys_trees_load_control_if_deferred (triggered by the
+	 * first get_sys_tree() call) is what populates
+	 * checkpoint_state->lastCheckpointNumber from the PageServer-hosted
+	 * control file on post-crash stateless restart. Capturing at function
+	 * entry reads a stale 0 and ends up misrouting seq-buf slot indices
+	 * downstream (ckpt_init_new with chkpNum=1, then
+	 * sort_checkpoint_map_file reaching for 2-5.map that nothing created).
+	 */
+	uint32		cur_chkp_num = 0;
+	uint32		prev_chkp_num = 0;
 	MemoryContext prev_context;
 	ODBProcData *my_proc_info = GET_CUR_PROCDATA();
 	UndoLocation checkpoint_start_loc[NUM_CHECKPOINTABLE_UNDO_LOGS],
@@ -1248,6 +1259,16 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 
 	for (i = 1; i <= SYS_TREES_NUM; i++)
 		(void) get_sys_tree(i);
+
+	/*
+	 * Capture cur_chkp_num / prev_chkp_num AFTER the sys-tree pre-loop,
+	 * so that sys_trees_load_control_if_deferred has had a chance to
+	 * populate lastCheckpointNumber from the PageServer-hosted control
+	 * file on post-crash stateless restart. See the companion comment at
+	 * the declaration above.
+	 */
+	cur_chkp_num = checkpoint_state->lastCheckpointNumber + 1;
+	prev_chkp_num = checkpoint_state->lastCheckpointNumber;
 
 	maxLocation = 0;
 
