@@ -253,25 +253,46 @@ static void
 write_buffer_data(OBuffersDesc *desc, char *data, uint32 tag, uint64 blockNum)
 {
 	int			result;
+	bool		wal_emitted = false;
 
 	Assert(OBuffersMaxTagIsValid(tag));
 
-	open_file(desc, tag, blockNum / (desc->singleFileSize / ORIOLEDB_BLCKSZ), true);
-	result = OFileWrite(desc->curFile, data, ORIOLEDB_BLCKSZ,
-						(blockNum * ORIOLEDB_BLCKSZ) % desc->singleFileSize,
-						WAIT_EVENT_SLRU_WRITE);
-	if (result != ORIOLEDB_BLCKSZ)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not write buffer to file %s: %m", desc->curFileName)));
-
 	/*
-	 * Plan B: mirror the write into the WAL as a full page image. PageServer
-	 * treats the record as a Value::Image so later smgrread() on the synthetic
-	 * relation returns exactly this content, even if the compute is restarted
-	 * on a different node with no local orioledb_undo / xidmap files.
+	 * Phase 6.6.2 — WAL-then-FS ordering discipline.
 	 *
-	 * Uses the same REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT flags as Plan E for
-	 * B-tree pages so wal_decoder recognises the record as an image.
+	 * Emit the Plan B WAL record BEFORE touching the local file. Under
+	 * Log-is-Data the local file is a compute-local cache, and a crash
+	 * that happens between these two steps must not leave the local file
+	 * in a state that wasn't yet described in WAL — on stateless restart
+	 * the local file is gone, WAL replay is what the next compute sees.
+	 *
+	 * Persistence layering for undo/xidmap data (audited 2026-04-18, see
+	 * docs/BASEBACKUP_AUDIT.md for the basebackup side):
+	 *
+	 *   1. Row-level WAL via ORIOLEDB_XLOG_CONTAINER (recovery/wal.c:980)
+	 *      is the *source of truth* for every undo / xidmap byte. Backends
+	 *      emit CONTAINER records at transaction time, before commit.
+	 *      Recovery can reconstruct every live undo record by replaying
+	 *      CONTAINER records from the redo start LSN forward.
+	 *
+	 *   2. Plan B FPI (emitted here) is a *recovery accelerator*: it
+	 *      publishes a point-in-time image of the buffer so that
+	 *      stateless restart does not have to replay CONTAINER records
+	 *      all the way back to the dawn of the log. Without a fresh FPI,
+	 *      recovery still succeeds as long as CONTAINER records covering
+	 *      the range are retained; with a fresh FPI, recovery starts
+	 *      later and is cheaper.
+	 *
+	 * checkpoint_is_shutdown guard (preserved): a late XLogInsert while
+	 * PG is tearing down WAL insertion triggers the "concurrent
+	 * write-ahead log activity while database system is shutting down"
+	 * PANIC. The prior regular checkpoint's FPIs plus CONTAINER records
+	 * emitted before shutdown collectively cover the data; the
+	 * end-of-recovery checkpoint on the next stateless restart will emit
+	 * fresh FPIs. Skipping is safe because persistence does not rely on
+	 * Plan B alone — this guard was rediscovered in Phase 6.6.2 review
+	 * and must not be removed without also severing the CONTAINER-record
+	 * dependency.
 	 */
 	extern bool checkpoint_is_shutdown;
 	if (obuffers_planb_enabled(desc) && !checkpoint_is_shutdown)
@@ -294,8 +315,29 @@ write_buffer_data(OBuffersDesc *desc, char *data, uint32 tag, uint64 blockNum)
 		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM,
 						  (BlockNumber) blockNum,
 						  page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
+		(void) XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
+		wal_emitted = true;
 	}
+
+	/*
+	 * Ordering invariant: once Plan B is active and we are NOT in the
+	 * shutdown carve-out, the WAL record must have been emitted before
+	 * the local cache refresh below. Written as an assert (not a runtime
+	 * check) because all gating conditions collapse deterministically
+	 * from the branch taken above; this is a tripwire against future
+	 * edits that reshuffle the branch without updating the invariant.
+	 */
+	Assert(desc->planBLogId == 0 || smgr_hook == NULL ||
+		   RecoveryInProgress() || !XLogInsertAllowed() ||
+		   AmStartupProcess() || checkpoint_is_shutdown || wal_emitted);
+
+	open_file(desc, tag, blockNum / (desc->singleFileSize / ORIOLEDB_BLCKSZ), true);
+	result = OFileWrite(desc->curFile, data, ORIOLEDB_BLCKSZ,
+						(blockNum * ORIOLEDB_BLCKSZ) % desc->singleFileSize,
+						WAIT_EVENT_SLRU_WRITE);
+	if (result != ORIOLEDB_BLCKSZ)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not write buffer to file %s: %m", desc->curFileName)));
 }
 
 static void

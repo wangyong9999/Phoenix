@@ -128,22 +128,55 @@ reservation and add cross-OID non-overlap checks.
 catch any future reservation that would overlap another or re-enter
 the user range; no behavioral change in Plan E / Plan B paths.
 
-### 6.6.2 — WAL-then-FS write path (full scope, locked by 6.6.0)
+### 6.6.2 — WAL-then-FS write path ordering (scope refined during implementation)
 
-6.6.0 confirmed basebackup does not cover `orioledb_data/`. Scope is
-the full write-path inversion:
+Phase 6.6.2 implementation surfaced a subtlety that forced a scope
+refinement relative to what 6.6.0's write-up hinted at:
 
-- `write_buffer_data` (`o_buffers.c:214-254`) emits `XLogInsert` first;
-  the local FS write is downgraded to a buffered cache flush (no fsync
-  on the OrioleDB buffer boundary — WAL fsync at commit is still
-  authoritative). Crash-mid-write leaves a local file in any state,
-  and recovery ignores it: WAL replay rebuilds the buffer from the
-  authoritative FPI sequence.
-- Remove the `checkpoint_is_shutdown` skip on Plan B mirror
-  (`o_buffers.c:233`). Under WAL-then-FS, shutdown checkpoints have
-  no reason to bypass WAL.
-- Add a write-path assert: every non-empty local buffer write is
-  preceded by a successful `XLogInsert` returning a valid LSN.
+**Persistence layering, re-audited.** Undo / xidmap content is *not*
+solely carried by Plan B FPIs. Backends emit
+`ORIOLEDB_XLOG_CONTAINER` records (`recovery/wal.c:980`) at
+transaction time that carry every row-level change. Plan B FPIs are
+a *recovery accelerator* — they bound how far back stateless restart
+has to replay CONTAINER records before reconstructing live undo
+state. Without a fresh FPI, recovery still succeeds as long as
+CONTAINER records covering the gap are retained.
+
+This matters for the `checkpoint_is_shutdown` carve-out. The earlier
+view was "skip = data loss" because Plan B was assumed to be the
+sole durability path. It is not. CONTAINER records emitted before
+shutdown cover the data, and the end-of-recovery checkpoint on the
+next stateless restart emits fresh FPIs. Removing the guard would
+re-introduce the `"concurrent write-ahead log activity while
+database system is shutting down"` PANIC fixed by commit `0b44cfd`
+for the same class of writes. **Guard preserved.**
+
+**Applied changes:**
+
+- `write_buffer_data` (`o_buffers.c`) reordered so that `XLogInsert`
+  runs BEFORE `open_file` / `OFileWrite`. Under Log-is-Data the
+  local file is a compute-local cache, and a crash mid-function must
+  not leave the local cache in a state not described in WAL — on
+  stateless restart the local cache is gone and WAL replay is what
+  defines state.
+- Assertion tripwire added: once Plan B is active and no gate
+  condition (RecoveryInProgress / !XLogInsertAllowed /
+  AmStartupProcess / checkpoint_is_shutdown / non-Neon smgr) is set,
+  the WAL record must have been emitted before the local write.
+  Written as `Assert`, not runtime error, because all gate
+  conditions collapse deterministically from the branch above —
+  the assert exists to catch future edits that reshuffle the
+  branch without updating the invariant.
+- `checkpoint_is_shutdown` guard **retained** with a comment that
+  names the CONTAINER-record dependency explicitly, so any future
+  change that severs that dependency (e.g. dropping CONTAINER
+  records from WAL) must also revisit the guard.
+
+**Weight guard.** Since the ordering change moves existing calls
+around but does not add new ones, the WAL byte count and INSERT
+latency baseline are structurally unchanged. Empirical benchmark
+still required before Release Gate §5 — deferred to the Phase 6.6
+completion commit after 6.6.4 E2E is added.
 
 **Weight guard.** Benchmark WAL bytes/sec and end-to-end INSERT
 latency against the pre-6.6.2 baseline. If writes go up by more than
