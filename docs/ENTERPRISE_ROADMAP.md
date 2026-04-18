@@ -337,9 +337,50 @@ LOG: OrioleDB: sync_lsn updated to 0/170BAD8 after checkpoint 4
 
 Checkpoint 4 is now structurally correct and completes end-to-end.
 
-### 6.6.4c — User-table page version on post-crash read (NEW, found by 6.6.4b iter3)
+### 6.6.4c — User-table page version on post-crash read (PARTIALLY RESOLVED in alpha.5)
 
-**Status:** Known issue in v0.1.0-alpha.4, blocks v0.2.0-beta.1.
+**Status:** Two sub-bugs fixed in v0.1.0-alpha.5. One remaining (count=0
+post-restart instead of 1000). Alpha.5 CI progression: FATAL gone,
+test now reaches step 8 and reads a clean but empty table.
+
+**Sub-bug 6.6.4c-1 (fixed, commit `e6db6ed`):** `orioledb.skip_unmodified_trees`
+GUC defaulted to true. `check_tree_needs_checkpointing`
+(checkpoint.c:5042) gated the "no shared_root_info, no evicted_data
+→ skip" path on this GUC. On stateless restart, the user-table
+entry in `shared_root_info` sys tree may be absent (WAL replay's
+`o_fetch_table_descr` path didn't populate it in this scenario), so
+end-of-recovery checkpoint skipped user trees, leaving PageServer
+with stale FPIs only. Fix: append `orioledb.skip_unmodified_trees =
+false` to `postgresql.conf` on the stateless-restart path in
+`compute_tools/src/compute.rs`. The earlier removal of this setting
+was based on an incorrect assumption (page-level delta WAL being in
+place).
+
+**Sub-bug 6.6.4c-2 (fixed, commit `397af78`):** PageServer's
+`put_rel_creation` at `pgdatadir_mapping.rs:2451` **unconditionally
+writes** `rel_size = nblocks` (0 from SMGR_CREATE ingest) even for
+existing relations. The reldir insert paths (`put_rel_creation_v1`
+/ `_v2`) were already idempotent, but the trailing size write
+wasn't. OrioleDB emits SMGR_CREATE on every process startup
+(process-local `registered_rels` cache), so a stateless-restart
+compute truncated every synthetic relation to 0 blocks in
+PageServer's view. Subsequent reads returned zero pages, triggering
+the Page version 0 FATAL. Fix: gate the size write on
+`get_rel_exists()` — skip it for already-existing rels.
+
+**Remaining issue 6.6.4c-3 (NOT yet fixed, blocks v0.2.0-beta.1):**
+Test now reaches `[8/10] Reconnect and read the table` without
+FATAL, but:
+```
+after-crash:  count=0 checksum=
+FAIL: row count changed across crash+restart (1000 -> 0)
+```
+Either (a) the pre-crash FPIs for data blocks weren't retained
+across the crash, (b) the post-restart rel_size ended up 0 despite
+the fix, or (c) the tree's root points to a block that's valid but
+reads as empty (metadata corruption / LSN timing). Needs one more
+diagnostic round printing PageServer's view of `rel_size` for
+(5, 16476) main fork at post-crash compute startup.
 
 After Phase 6.6.4b iter3 resolves the checkpoint-4 init race, the
 6.6.4 crash E2E progresses to the SELECT post-restart, which now
