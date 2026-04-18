@@ -68,15 +68,24 @@ typedef struct
  * Synthetic RelFileNumber used to publish the OrioleDB checkpoint control
  * file to Neon PageServer as a single-block fake relation.
  *
- * Chosen in the "user-space" OID range (> FirstNormalObjectId = 16384) but
- * far below the space any real user would hit in practice. Reserved for
- * exclusive use by OrioleDB Plan E.
+ * Placed in the top 256 values of the 32-bit RelFileNumber space, which
+ * PG's user-relfilenode allocator will not reach before OID wraparound —
+ * hitting this range requires ~4.29 billion relfilenode allocations in a
+ * single cluster, which is unreachable by any practical workload.
+ *
+ * Any overlap with user relfilenodes would cause PageServer to conflate
+ * OrioleDB control-file pages with a user table's block 0 at the same
+ * tablespace, which is silent corruption. Keep this reservation disjoint
+ * from the OrioleDB o_buffers reservation range (ORIOLEDB_OBUF_* in
+ * o_buffers.c); the StaticAssert in o_buffers.c enforces non-overlap.
  */
-#define ORIOLEDB_CONTROL_FILE_OID	65500
+#define ORIOLEDB_CONTROL_FILE_OID	0xFFFFFFFEu
 
-StaticAssertDecl(ORIOLEDB_CONTROL_FILE_OID > 16384 &&
-				 ORIOLEDB_CONTROL_FILE_OID < UINT32_MAX - 1,
-				 "ORIOLEDB_CONTROL_FILE_OID must live in the user OID range");
+StaticAssertDecl(ORIOLEDB_CONTROL_FILE_OID >= 0xFFFFFF00u &&
+				 ORIOLEDB_CONTROL_FILE_OID < UINT32_MAX,
+				 "ORIOLEDB_CONTROL_FILE_OID must live in the reserved "
+				 "top-256 synthetic OID range (0xFFFFFF00 .. 0xFFFFFFFE) "
+				 "to stay unreachable by PG's user-relfilenode allocator");
 
 #define GetCheckpointableUndoLog(i) \
 	(AssertMacro((i) >= 0 && (i) < 2), \

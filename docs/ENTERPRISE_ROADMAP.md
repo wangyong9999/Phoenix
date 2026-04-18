@@ -86,26 +86,47 @@ expensive write-path work (`6.6.2`).
 >   2. `o_buffers.c:233` `checkpoint_is_shutdown` skip on Plan B
 >      mirror must be removed.
 
-### 6.6.1 — dbOid / relNumber alignment
+### 6.6.1 — Synthetic OID reservation hardening
 
-**Current state.** `o_buffers.c:239,285` and `checkpoint.c:2961`
-hard-code `dbOid = 0` for synthetic relations (undo log 1, xidmap 2,
-checkpoint map files). This collides across databases the moment
-OrioleDB is installed in more than one database in a tenant.
+**Correction from initial premise.** The early audit claimed
+`dbOid = 0` in `o_buffers.c:239,285` caused a multi-database
+collision. Re-read of the code shows this is wrong:
+`undoBuffersDesc` (`transam/undo.c:194`) and `buffersDesc`
+(`transam/oxid.c:144`) are each a single static shmem instance per
+PG cluster, and the OrioleDB control file is one-per-cluster. They
+are **genuinely cluster-global like SLRUs**, and `dbOid = 0` is
+architecturally correct for them. The per-table map files already
+use `rlocator.dbOid = datoid` (`checkpoint.c:2948`).
 
-**Target.** Synthetic relation OIDs drawn from a reserved range that
-does not collide with PG system catalog OID allocation and is
-tenant/timeline-namespaced at the PageServer key layer, matching how
-Neon's other synthetic relations (SLRU mirrors) are keyed today.
+**The real risk.** Synthetic OIDs (`ORIOLEDB_CONTROL_FILE_OID =
+65500`; `ORIOLEDB_OBUF_RELNODE_BASE = 65600` + up to 2×16 entries
+for undo/xidmap) sit in the user OID range. The current StaticAssert
+(`control.h:77`) only checks `> 16384`, and the comment at `control.h:
+71-73` calls the range "below space any real user would hit in
+practice" — an optimism, not a guarantee. A long-running cluster
+that allocates a user relfilenode in `[65500, 65648)` collides with
+OrioleDB's reservations.
 
-**Scope.** Read neon's SLRU mirroring code for the precedent. Update
-`pgxn/orioledb/src/utils/o_buffers.c`, `transam/undo.c`,
-`transam/oxid.c`, `checkpoint.c` to draw OIDs from that range. Add a
-regression test with two databases both using `CREATE EXTENSION
-orioledb`.
+**Target.** Move synthetic OIDs into `[0xFFFFFF00, UINT32_MAX - 1)`
+— a range that PG's user-relfilenode allocator cannot reach in any
+practical workload (it would require 4.29 billion relfilenode
+allocations). Strengthen the StaticAssert to enforce the new
+reservation and add cross-OID non-overlap checks.
 
-**Exit criterion.** Two databases in a tenant both running OrioleDB
-writes and reads correctly survive stateless restart independently.
+**Scope.**
+- `pgxn/orioledb/include/checkpoint/control.h` — relocate
+  `ORIOLEDB_CONTROL_FILE_OID`, tighten StaticAssert.
+- `pgxn/orioledb/src/utils/o_buffers.c` — relocate
+  `ORIOLEDB_OBUF_RELNODE_BASE`, add StaticAssert proving
+  `[OBUF_BASE, OBUF_BASE + max_obuf_count)` does not overlap with
+  `ORIOLEDB_CONTROL_FILE_OID`.
+- Update comments that today say "below space any real user would
+  hit in practice" to the stronger and honest "unreachable by any
+  practical PG workload before OID wraparound".
+
+**Exit criterion.** Reserved OIDs live in the high range; asserts
+catch any future reservation that would overlap another or re-enter
+the user range; no behavioral change in Plan E / Plan B paths.
 
 ### 6.6.2 — WAL-then-FS write path (full scope, locked by 6.6.0)
 

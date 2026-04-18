@@ -22,6 +22,7 @@
 #include "btree/btree.h"
 #include "btree/io.h"
 #include "catalog/pg_tablespace_d.h"
+#include "checkpoint/control.h"		/* ORIOLEDB_CONTROL_FILE_OID for StaticAssert */
 #include "miscadmin.h"
 #include "storage/procnumber.h"
 #include "storage/smgr.h"
@@ -39,12 +40,48 @@
  * a synthetic relation per OBuffersDesc. PageServer stores the image and
  * serves it back through smgr when the local file is missing.
  *
+ * These logs are genuinely cluster-global (single static OBuffersDesc in
+ * shmem, one set of undo/xidmap for the whole PG cluster), so keying them
+ * with dbOid = 0 alongside SLRU-like cluster state is architecturally
+ * correct. The concern that Phase 6.6.1 closes is not a dbOid collision
+ * but a relNumber collision: the OIDs below must not overlap with any
+ * relfilenode that PG's user-relfilenode allocator could produce.
+ *
  * Mapping: each OBuffersDesc gets a distinct relNumber in the
  * ORIOLEDB_OBUF_RELNODE_BASE reserved range so different log streams
  * (undo row / undo page / undo system / xidmap) never collide.
+ *
+ * ORIOLEDB_OBUF_RELNODE_BASE is placed in the top 256 values of the
+ * 32-bit RelFileNumber space, together with ORIOLEDB_CONTROL_FILE_OID
+ * (see include/checkpoint/control.h). This range is unreachable by PG's
+ * user-relfilenode allocator in any practical workload (would require
+ * ~4.29 billion allocations in a single cluster). The StaticAssert below
+ * enforces non-overlap with ORIOLEDB_CONTROL_FILE_OID.
+ *
+ * ORIOLEDB_OBUF_MAX_LOGS caps the number of Plan B log streams that can
+ * coexist; each stream consumes ORIOLEDB_OBUF_TAGS_PER_LOG relfilenodes.
+ * Bump only after re-checking the StaticAssert.
  */
-#define ORIOLEDB_OBUF_RELNODE_BASE  65600u
+#define ORIOLEDB_OBUF_RELNODE_BASE  0xFFFFFF00u
 #define ORIOLEDB_OBUF_TAGS_PER_LOG  16
+#define ORIOLEDB_OBUF_MAX_LOGS      14	/* 14 * 16 = 224; base + 224 = 0xFFFFFFE0, below control oid */
+
+/*
+ * Top relnode actually emitted by obuffers_relnode() when planBLogId
+ * is at its runtime ceiling (ORIOLEDB_OBUF_MAX_LOGS) and the tag hash
+ * lands on the last slot (ORIOLEDB_OBUF_TAGS_PER_LOG - 1). This is the
+ * concrete upper bound the StaticAssert must clear.
+ */
+#define ORIOLEDB_OBUF_MAX_RELNODE \
+	(ORIOLEDB_OBUF_RELNODE_BASE + \
+	 (uint32) ORIOLEDB_OBUF_MAX_LOGS * ORIOLEDB_OBUF_TAGS_PER_LOG + \
+	 (ORIOLEDB_OBUF_TAGS_PER_LOG - 1))
+
+StaticAssertDecl(ORIOLEDB_OBUF_RELNODE_BASE >= 0xFFFFFF00u &&
+				 ORIOLEDB_OBUF_MAX_RELNODE < ORIOLEDB_CONTROL_FILE_OID,
+				 "ORIOLEDB_OBUF reservation window must live in the "
+				 "reserved top-256 synthetic OID range and must not "
+				 "overlap ORIOLEDB_CONTROL_FILE_OID at its highest slot");
 
 static uint32
 obuffers_relnode(OBuffersDesc *desc, uint32 tag)
@@ -53,8 +90,15 @@ obuffers_relnode(OBuffersDesc *desc, uint32 tag)
 	 * Stable across restarts: driven by the user-supplied planBLogId and the
 	 * tag (segment family within the log). A log must declare planBLogId != 0
 	 * to participate in Plan B mirroring.
+	 *
+	 * planBLogId must stay within [1, ORIOLEDB_OBUF_MAX_LOGS]; a value >=
+	 * ORIOLEDB_OBUF_MAX_LOGS would push the computed relnode past the
+	 * control-file OID and silently collide with it. Enforced at runtime
+	 * (planBLogId is a struct field, so the StaticAssert at file scope can
+	 * only bound the *window*, not individual values).
 	 */
 	Assert(desc->planBLogId != 0);
+	Assert(desc->planBLogId <= ORIOLEDB_OBUF_MAX_LOGS);
 	return ORIOLEDB_OBUF_RELNODE_BASE +
 		(uint32) desc->planBLogId * ORIOLEDB_OBUF_TAGS_PER_LOG +
 		(tag & (ORIOLEDB_OBUF_TAGS_PER_LOG - 1));
