@@ -1057,6 +1057,9 @@ o_get_latest_chkp_num(Oid datoid, Oid relnode, uint32 max_chkp_num,
 
 	if (O_TUPLE_IS_NULL(result_tuple))
 	{
+		elog(LOG, "o_get_latest_chkp_num: (%u, %u) no entry in "
+			 "SYS_TREES_CHKP_NUM — returning max_chkp_num=%u",
+			 datoid, relnode, max_chkp_num);
 		if (found)
 			*found = false;
 		return max_chkp_num;
@@ -1072,6 +1075,9 @@ o_get_latest_chkp_num(Oid datoid, Oid relnode, uint32 max_chkp_num,
 	if (result->checkpointNumbers[1] <= max_chkp_num &&
 		result->checkpointNumbers[1] > chkp_num)
 		chkp_num = result->checkpointNumbers[1];
+	elog(LOG, "o_get_latest_chkp_num: (%u, %u) max=%u → %u (entries[%u, %u])",
+		 datoid, relnode, max_chkp_num, chkp_num,
+		 result->checkpointNumbers[0], result->checkpointNumbers[1]);
 	pfree(result_tuple.data);
 
 	return chkp_num;
