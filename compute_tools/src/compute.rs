@@ -1637,20 +1637,17 @@ impl ComputeNode {
                 };
                 info!("safekeepers synced at LSN {}", lsn);
 
-                // OrioleDB serverless: persist the sync LSN and initialized
-                // marker so that on restart we know the redo start point
-                // for OrioleDB WAL replay (orioledb_recovery.signal).
-                //
-                // Write order: sync_lsn FIRST, then marker. On read, we
-                // check marker first — if it exists but sync_lsn is missing,
-                // we skip recovery rather than use a wrong LSN.
+                // OrioleDB serverless: persist the sync LSN so that on
+                // restart we know the redo start point for OrioleDB WAL
+                // replay (orioledb_recovery.signal). N1 removed the
+                // redundant `.orioledb_initialized` marker — sync_lsn's
+                // presence is the authoritative "has been initialised"
+                // signal.
                 let endpoint_dir = pgdata_path.parent().unwrap_or(Path::new("."));
                 let sync_lsn_file = endpoint_dir.join(".orioledb_sync_lsn");
-                let orioledb_marker = endpoint_dir.join(".orioledb_initialized");
                 if !sync_lsn_file.exists() {
                     std::fs::write(&sync_lsn_file, format!("{}", lsn))?;
-                    std::fs::write(&orioledb_marker, "initialized")?;
-                    info!("OrioleDB: saved sync LSN {} and initialized marker", lsn);
+                    tracing::error!("OrioleDB: saved sync LSN {} at {}", lsn, sync_lsn_file.display());
                 }
 
                 lsn
@@ -1733,20 +1730,26 @@ impl ComputeNode {
             // skip_unmodified_trees=false — emits fresh FPIs for every known
             // OrioleDB tree so post-restart backends see consistent state.
             let endpoint_dir = pgdata_path.parent().unwrap_or(pgdata_path);
-            let was_initialized = endpoint_dir.join(".orioledb_initialized").exists();
+            let sync_lsn_file = endpoint_dir.join(".orioledb_sync_lsn");
+            let sync_lsn_present = sync_lsn_file.exists();
 
-            // Phase 6.6.4c diagnostics — error!() level so it survives any
-            // tracing filter and is visible in the CI log.
+            // Phase 6.6.4c / N1 — treat sync_lsn presence as the
+            // authoritative "this compute has been initialised before"
+            // signal. has_orioledb is kept only for the first-ever start
+            // path (sync_lsn not yet saved), and otherwise drop gating on
+            // it: if sync_lsn is there, the previous incarnation was an
+            // OrioleDB primary, we owe it a recovery signal regardless of
+            // what the current postgresql.conf happens to contain.
             tracing::error!(
-                "OrioleDB recovery check: has_orioledb={} was_initialized={} \
-                 endpoint_dir={} marker_path={}",
+                "OrioleDB recovery check: has_orioledb={} sync_lsn_present={} \
+                 endpoint_dir={} sync_lsn_path={}",
                 has_orioledb,
-                was_initialized,
+                sync_lsn_present,
                 endpoint_dir.display(),
-                endpoint_dir.join(".orioledb_initialized").display()
+                sync_lsn_file.display()
             );
 
-            if has_orioledb && was_initialized {
+            if sync_lsn_present {
                 // Copy SafeKeeper WAL files to pg_wal/ for replay
                 if let (Some(tid), Some(tlid)) = (spec.tenant_id, spec.timeline_id) {
                     let neon_dir = pgdata_path
