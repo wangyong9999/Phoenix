@@ -82,6 +82,7 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/mman.h>
 
 PG_MODULE_MAGIC;
@@ -457,6 +458,27 @@ _PG_init(void)
 
 	if (!process_shared_preload_libraries_in_progress)
 		return;
+
+	/*
+	 * Phase 6.6.4c diagnostic — log what state the orioledb_recovery.signal
+	 * is in right as OrioleDB loads. _PG_init runs in the postmaster before
+	 * StartupXLOG consumes the signal, so this tells us definitively whether
+	 * the file was on disk at PG start.
+	 */
+	{
+		struct stat st;
+		int			rc_sig = stat("orioledb_recovery.signal", &st);
+		int			rc_neon = stat("neon.signal", &st);
+		char		cwdbuf[MAXPGPATH];
+
+		if (getcwd(cwdbuf, sizeof(cwdbuf)) == NULL)
+			strcpy(cwdbuf, "(err)");
+		elog(LOG, "OrioleDB _PG_init diag: cwd=%s orioledb_recovery.signal=%s "
+			 "neon.signal=%s",
+			 cwdbuf,
+			 rc_sig == 0 ? "PRESENT" : "absent",
+			 rc_neon == 0 ? "PRESENT" : "absent");
+	}
 
 	/*
 	 * In Neon's wal-redo mode, skip filesystem and shared memory operations.

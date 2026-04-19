@@ -3111,9 +3111,26 @@ fn write_orioledb_recovery_signal(
     }
 
     let signal_path = pgdata_path.join("orioledb_recovery.signal");
-    std::fs::write(&signal_path, sync_lsn_trimmed).with_context(|| {
-        format!("writing orioledb_recovery.signal to {}", signal_path.display())
-    })?;
+    {
+        // Open+write+fsync explicitly so the file is durable on disk before
+        // PG starts and before any other thread can observe a half-written
+        // state.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&signal_path)
+            .with_context(|| {
+                format!("creating orioledb_recovery.signal at {}", signal_path.display())
+            })?;
+        f.write_all(sync_lsn_trimmed.as_bytes())?;
+        f.sync_all()?;
+    }
+    // fsync the parent dir so the dirent is persisted.
+    if let Ok(dir) = std::fs::File::open(pgdata_path) {
+        let _ = dir.sync_all();
+    }
     if !signal_path.exists() {
         anyhow::bail!(
             "orioledb_recovery.signal at {} vanished after write",
