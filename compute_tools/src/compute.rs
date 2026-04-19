@@ -1789,37 +1789,14 @@ impl ComputeNode {
                 // Validate that sync_lsn is present and well-formed —
                 // writing an empty signal file would cause PG to enter
                 // recovery with an uninitialized redo LSN.
-                let sync_lsn_file = endpoint_dir.join(".orioledb_sync_lsn");
-                let sync_lsn_str = std::fs::read_to_string(&sync_lsn_file)
-                    .unwrap_or_default();
-                let sync_lsn_trimmed = sync_lsn_str.trim();
-
-                if sync_lsn_trimmed.is_empty() || !sync_lsn_trimmed.contains('/') {
-                    warn!(
-                        "OrioleDB recovery: sync LSN missing or invalid (got {:?}), \
-                         skipping WAL replay — will start fresh",
-                        sync_lsn_trimmed
-                    );
-                } else {
-                    let signal_path = pgdata_path.join("orioledb_recovery.signal");
-                    std::fs::write(&signal_path, sync_lsn_trimmed)?;
-                    // Post-write verification: re-stat and abort if missing.
-                    // Any race that loses the signal file must surface here,
-                    // not later as count=0 post-restart.
-                    if !signal_path.exists() {
-                        anyhow::bail!(
-                            "OrioleDB recovery: signal file {} vanished after \
-                             write — aborting to avoid silent data loss",
-                            signal_path.display()
+                let written = write_orioledb_recovery_signal(pgdata_path, endpoint_dir)?;
+                let sync_lsn_trimmed = match written {
+                    None => {
+                        warn!(
+                            "OrioleDB recovery: sync LSN missing or invalid — \
+                             skipping WAL replay (first-start or corrupted)"
                         );
-                    }
-                    tracing::error!(
-                        "OrioleDB recovery: signal written to {} (lsn={})",
-                        signal_path.display(),
-                        sync_lsn_trimmed
-                    );
-                    // File-based diagnostic mirror (see above).
-                    {
+                        // Also write a diagnostic breadcrumb.
                         use std::io::Write;
                         let diag_path = endpoint_dir.join(".orioledb_recovery_diag.log");
                         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -1827,14 +1804,40 @@ impl ComputeNode {
                         {
                             let _ = writeln!(
                                 f,
-                                "[{}] signal_written: path={} lsn={} size_ok={}",
-                                chrono::Utc::now().to_rfc3339(),
-                                signal_path.display(),
-                                sync_lsn_trimmed,
-                                signal_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                                "[{}] signal_skipped: reason=sync_lsn_missing_or_invalid",
+                                chrono::Utc::now().to_rfc3339()
                             );
                         }
+                        String::new()
                     }
+                    Some(lsn) => {
+                        let signal_path = pgdata_path.join("orioledb_recovery.signal");
+                        tracing::error!(
+                            "OrioleDB recovery: signal written to {} (lsn={})",
+                            signal_path.display(),
+                            lsn
+                        );
+                        // File-based diagnostic mirror (see above).
+                        {
+                            use std::io::Write;
+                            let diag_path = endpoint_dir.join(".orioledb_recovery_diag.log");
+                            if let Ok(mut f) = std::fs::OpenOptions::new()
+                                .create(true).append(true).open(&diag_path)
+                            {
+                                let _ = writeln!(
+                                    f,
+                                    "[{}] signal_written: path={} lsn={} size_ok={}",
+                                    chrono::Utc::now().to_rfc3339(),
+                                    signal_path.display(),
+                                    lsn,
+                                    signal_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                                );
+                            }
+                        }
+                        lsn
+                    }
+                };
+                if !sync_lsn_trimmed.is_empty() {
 
                     // Phase 6.6.4c: force orioledb.skip_unmodified_trees=false
                     // only for this stateless-restart boot, so the
@@ -3082,6 +3085,51 @@ pub async fn installed_extensions(conf: tokio_postgres::Config) -> Result<()> {
 /// region. PG expects valid XLogPageHeaders on every 8KB page boundary,
 /// rejecting files with "invalid magic number 0000".
 ///
+/// Write the orioledb_recovery.signal file into pgdata based on sync_lsn
+/// saved at $endpoint_dir/.orioledb_sync_lsn.
+///
+/// Returns `Ok(Some(lsn_string))` if signal was written, `Ok(None)` if the
+/// sync_lsn marker is missing or invalid (first-start or corrupted).
+///
+/// Invariant tested by `orioledb_recovery_signal_*` unit tests:
+/// - sync_lsn present + well-formed → signal written, contents match
+/// - sync_lsn missing → no signal written, Ok(None)
+/// - sync_lsn empty/invalid → no signal written, Ok(None)
+/// - post-write stat confirms signal file exists non-empty
+fn write_orioledb_recovery_signal(
+    pgdata_path: &Path,
+    endpoint_dir: &Path,
+) -> Result<Option<String>> {
+    let sync_lsn_file = endpoint_dir.join(".orioledb_sync_lsn");
+    if !sync_lsn_file.exists() {
+        return Ok(None);
+    }
+    let sync_lsn_str = std::fs::read_to_string(&sync_lsn_file).unwrap_or_default();
+    let sync_lsn_trimmed = sync_lsn_str.trim();
+    if sync_lsn_trimmed.is_empty() || !sync_lsn_trimmed.contains('/') {
+        return Ok(None);
+    }
+
+    let signal_path = pgdata_path.join("orioledb_recovery.signal");
+    std::fs::write(&signal_path, sync_lsn_trimmed).with_context(|| {
+        format!("writing orioledb_recovery.signal to {}", signal_path.display())
+    })?;
+    if !signal_path.exists() {
+        anyhow::bail!(
+            "orioledb_recovery.signal at {} vanished after write",
+            signal_path.display()
+        );
+    }
+    let md = signal_path.metadata().with_context(|| "stat recovery signal")?;
+    if md.len() == 0 {
+        anyhow::bail!(
+            "orioledb_recovery.signal at {} is zero bytes",
+            signal_path.display()
+        );
+    }
+    Ok(Some(sync_lsn_trimmed.to_string()))
+}
+
 /// Recursively copy a directory tree.
 /// This function reads the system identifier from pg_control, then for each
 /// WAL segment file in the SafeKeeper directory, patches zero-filled pages
@@ -3302,5 +3350,83 @@ mod tests {
                     .starts_with("duplicate entry in safekeeper_connstrings:")
             ),
         };
+    }
+
+    /// Pins the N1 invariant: on restart, a well-formed sync_lsn marker must
+    /// produce `orioledb_recovery.signal` in pgdata with the same LSN bytes.
+    #[test]
+    fn orioledb_recovery_signal_written_when_sync_lsn_present() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "orioledb_sig_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let endpoint_dir = tmp.clone();
+        let pgdata = endpoint_dir.join("pgdata");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        {
+            let mut f = std::fs::File::create(endpoint_dir.join(".orioledb_sync_lsn"))
+                .unwrap();
+            f.write_all(b"0/14F2FC8").unwrap();
+        }
+        let result = write_orioledb_recovery_signal(&pgdata, &endpoint_dir).unwrap();
+        assert_eq!(result, Some("0/14F2FC8".to_string()));
+        let signal = pgdata.join("orioledb_recovery.signal");
+        assert!(signal.exists(), "signal file not created");
+        assert_eq!(std::fs::read_to_string(&signal).unwrap(), "0/14F2FC8");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Pins the N1 invariant: no sync_lsn marker ⇒ no signal written.
+    /// This is the first-start case.
+    #[test]
+    fn orioledb_recovery_signal_skipped_when_sync_lsn_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "orioledb_sig_test_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let endpoint_dir = tmp.clone();
+        let pgdata = endpoint_dir.join("pgdata");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        let result = write_orioledb_recovery_signal(&pgdata, &endpoint_dir).unwrap();
+        assert_eq!(result, None);
+        assert!(!pgdata.join("orioledb_recovery.signal").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Pins the N1 invariant: empty/invalid sync_lsn ⇒ no signal written,
+    /// not a partial write. A zero-byte signal file would be worse than no
+    /// signal at all (PG would start recovery from an uninitialised LSN).
+    #[test]
+    fn orioledb_recovery_signal_skipped_on_invalid_sync_lsn() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "orioledb_sig_test_invalid_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let endpoint_dir = tmp.clone();
+        let pgdata = endpoint_dir.join("pgdata");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        // Empty file.
+        std::fs::File::create(endpoint_dir.join(".orioledb_sync_lsn")).unwrap();
+        let result = write_orioledb_recovery_signal(&pgdata, &endpoint_dir).unwrap();
+        assert_eq!(result, None);
+        assert!(!pgdata.join("orioledb_recovery.signal").exists());
+        // Now write garbage (no '/').
+        {
+            let mut f = std::fs::File::create(endpoint_dir.join(".orioledb_sync_lsn"))
+                .unwrap();
+            f.write_all(b"garbage").unwrap();
+        }
+        let result = write_orioledb_recovery_signal(&pgdata, &endpoint_dir).unwrap();
+        assert_eq!(result, None);
+        assert!(!pgdata.join("orioledb_recovery.signal").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
