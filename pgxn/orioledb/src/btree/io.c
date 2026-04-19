@@ -81,14 +81,21 @@ orioledb_neon_io_check(void)
 	neon_io_checked = 1;
 	if (smgr_hook != NULL)
 	{
+		struct stat st;
+		bool		sig_now = (stat("orioledb_recovery.signal", &st) == 0);
+		bool		init_mkr = (stat("../.orioledb_initialized", &st) == 0);
+		bool		sync_mkr = (stat("../.orioledb_sync_lsn", &st) == 0);
+
 		neon_io_enabled = true;
 		elog(LOG, "OrioleDB: Neon detected — page images will be sent via WAL "
 			 "(skip_unmodified_trees=%d recovery_requested=%d "
-			 "recovery_in_progress=%d startup=%d)",
+			 "recovery_in_progress=%d startup=%d "
+			 "signal_now=%d init_marker=%d sync_marker=%d)",
 			 skip_unmodified_trees,
 			 IsOrioleDbRecoveryRequested(),
 			 RecoveryInProgress(),
-			 AmStartupProcess());
+			 AmStartupProcess(),
+			 sig_now, init_mkr, sync_mkr);
 	}
 }
 
