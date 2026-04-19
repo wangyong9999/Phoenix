@@ -107,6 +107,8 @@ met and a regression test is in CI.
 | R21 | In-memory root after restart | `create_shared_root_info` allocates a fresh in-memory root page for every tree during `checkpointable_tree_init`. Meta-page gets `rootDownlink` from disk via Plan E, but the root-page *content* is not pre-loaded from disk. Btree walks use the in-memory page directly. Hypothesis: walks do not trigger a disk read to hydrate the root if the in-memory page is "valid but empty". Needs verification. | Restart backends see empty trees even though PageServer has chkp=3 FPIs. | REFUTED — `evictable_tree_init_meta` does call `read_page_from_disk(rootDownlink)` at line 5815 and `put_page_image` at 5826, so root IS hydrated. | — |
 | R22 | Post-split parent FPI gap | `orioledb_page_wal_split` emits FPIs for the two resulting pages (left/right). The PARENT's downlink-insertion — done by the caller via a normal btree write after the split returns — uses a different WAL path. For internal parent pages, our LEAF_INSERT FPI shim doesn't cover this path. PageServer's parent image stays pre-split; backends walking from a stale parent miss the post-split children's rows. Depth-chained splits make the gap propagate up to root. | 6.6.4c-3 count=0: post-chkp=3 splits update root in memory but not on PageServer; backend reads stale root and misses new leaves. | CONFIRMED via process-of-elimination once R21 was refuted. | Extend `orioledb_page_wal_split` to emit FPI for parent too, and/or add explicit page-level WAL for internal-page downlink inserts. Scoped extension of N2. |
 | R23 | Diag interpretation error | My evictable_tree_init_meta diag read `*(uint64*)buf` hoping to capture the first-page bytes, but line 1583 zeros that region *before* my log fires. The zeroes we saw were the intentional `o_header.state` / `o_header.pageChangeCount` wipe, not "PageServer returned an empty page". R21 was inferred from this misread data. | Wasted one CI round. | MITIGATED — record the lesson so future diag picks fields *after* byte 16 (e.g., itemsCount at offset 50). | — |
+| R24 | PageServer ingest lag vs basebackup LSN | PageServer ingests WAL asynchronously. The crash test SIGKILLs within ~200 ms of committing the post-chkp=3 500 rows. Basebackup is taken at PageServer's consistent LSN (fully ingested + not being reorganised). If PageServer hadn't ingested the post-chkp=3 records by SIGKILL, basebackup's consistent LSN = chkp=3 LSN. Backend reads at that LSN → sees chkp=3 state (500 rows if leaves are on disk). Backend walks from the chkp=3 root → children blknos that existed at chkp=3 → smgr reads those blocks. If PageServer only has chkp=3 FPIs (not post-chkp=3 modifications), the leaves' content is the pre-commits state. But if leaves were split post-chkp=3, their post-split content isn't in PageServer, and reads either return zero-fill (when blkno >= nblocks) or the stale pre-split content. | 6.6.4c-3 count=0 mechanism. | OPEN — needs direct PageServer layer-file inspection to confirm. | Fix requires either (a) waiting for ingest before basebackup in the crash test, (b) compute-side replay triggered by orioledb_recovery.signal that consumes reliably, or (c) the commit-barrier data-page FPI being preceded by a synchronous "push through to PageServer ingest" step. Most sustainable: (b). |
+| R25 | WAL record encoding / wal_decoder routing | My N2 patch emits `REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT` on an ORIOLEDB_XLOG_LEAF_INSERT record. `block_is_image` in wal_decoder returns true for rmid=129 FPIs and stores as `Value::Image` keyed at `(rel, blkno, lsn)`. Risk: the page image is extracted but the Image's byte content / hole-elimination / page-layout isn't compatible with OrioleDB's non-standard page header, so the PageServer-stored image is subtly wrong. On read back into backend shmem, the page passes `check_orioledb_page_version` (page_version byte survived) but walk-level fields (itemsCount, chunkDesc, etc.) are garbled. | Leaves read as empty even when PageServer received FPIs. | FORESEEN | Add end-to-end test that round-trips an OrioleDB page through wal_decoder as a Value::Image and verifies byte-identical content. `wal_decoder::test_orioledb_fpi_round_trip` already exists but does not cover my N2's exact flag combo; extend. |
 
 ---
 
@@ -389,3 +391,40 @@ starts.
   parent-page update site, then add FPI emission for parent writes
   (covers internal-page structure updates generally). This is a
   scoped extension of N2, not a separate phase.
+- **2026-04-19 r6**: R22 fix shipped (commit 6249cef: FPI on
+  non-leaf downlink insert). Still count=0 post-crash. R23-corrected
+  diag (commit a5eeec4) showed user table (5, 16476) root loads with
+  `itemsCount=7 chunksCount=7 level=1 chkpNum=3` — root has real
+  structure pointing to 7 leaf children. So the tree is not empty
+  at root level; leaves return empty.
+
+  **Hypothesis after r6**: PageServer doesn't have content for the
+  post-chkp=3 leaf blocks at the LSN basebackup is taken. Either:
+    (a) Async PageServer ingest hadn't caught up to the post-chkp=3
+        LEAF_INSERT FPIs at SIGKILL time → basebackup LSN < FPI LSN
+        → reads return zero-fill via smgrread nblocks < blkno path.
+    (b) My N2 FPI records have a routing issue — wal_decoder's
+        `block_is_image` returns true but the Image isn't keyed to
+        the right block, or REGBUF_WILL_INIT semantics drop the
+        image pre-application.
+    (c) Post-split downlink points to the LEFT-split page (which
+        has valid content from the split FPI) but the RIGHT-split
+        page (new blkno) doesn't match any downlink backend walks —
+        a structural mismatch between what root knows and what
+        PageServer has.
+
+  Next diagnostic (out of band, not CI): inspect PageServer's
+  layer-file contents directly for (5,16476,blkno=N) at basebackup
+  LSN to see if FPIs are present. If absent → R24 (ingest lag vs
+  basebackup LSN). If present with wrong content → R25 (WAL record
+  encoding bug in my N2).
+
+  This hits the limit of what CI iteration can resolve. Further
+  progress requires: (i) local reproduction with direct PageServer
+  layer-file inspection, (ii) or parallel investigation of how
+  upstream OrioleDB+Neon integration tests handle the same crash
+  scenario (they must — somewhere — otherwise the whole approach
+  wouldn't work). N1 and the R22/N2 architecture work are on the
+  right track but the current count=0 failure has an additional
+  mechanism we haven't nailed down. Keeping the N2/R22 commits
+  in tree as scaffolding for the eventual full fix.
