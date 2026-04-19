@@ -102,6 +102,9 @@ met and a regression test is in CI.
 | R16 | WAL retention | PITR target LSN must be within SafeKeeper / PageServer retention. Enterprise PITR UI must surface the lower bound so users cannot request lost LSNs. | Silent PITR miss. | OPEN | N7.2 surface retention in PITR API |
 | R17 | Commit-barrier contention | Multiple backends committing on the same leaf page emit N FPIs. WAL amplification 10-100×. | Throughput cliff on hot-key workloads. | FORESEEN | N2.6 commit-group amortisation |
 | R18 | Ordering at commit | Barrier items (undo, CSN, data pages) must all be in WAL **before** `XACT_COMMIT` is flushed. Crashes between barrier-emit and XLogFlush are safe (rollback), crashes between different barrier items are safe only because all are in the same WAL stream flushed atomically by `XLogFlush(commit_lsn)`. | Split-brain if XACT_COMMIT is flushed while a barrier item is still buffered. | ANALYSED — relies on PG's `XLogFlush(commit_lsn)` atomicity. Documented. | Design invariant baked into N2 |
+| R19 | EOR skip-on-clean | `checkpoint_tables_callback`'s inner `if (!dirtyFlag1 && !dirtyFlag2) skip=true` fires for every user tree untouched by the current session. When end-of-recovery runs after a restart where replay has NOT marked trees dirty, every user tree is skipped — no FPI, no map_write, no `o_update_latest_chkp_num`. Bypassing this inner skip is NOT safe: forcing a walk re-reads blocks via Neon smgr which exposes the PageServer wal-redo SEGV on `SYS_TREES_CHKP_NUM` block 1 (R20). | Data loss at count=0 even when SYS_TREES_CHKP_NUM and map files are intact. | CONFIRMED via CI 24621394503 diag. | Root fix is N2 (commit-barrier data page FPIs); dirty-flag skip becomes moot once data is authoritative on PageServer. Regression workaround attempted in 4b58e2a was reverted in c1a34ba. |
+| R20 | wal-redo SEGV on SYS_TREES_CHKP_NUM block 1 | Observed PageServer wal-redo process crash (SIGSEGV) when asked to materialize rel 1663/1/21 block 1 at specific LSN. Upstream or OrioleDB rmgr bug in the wal-redo path for this relation's leaf page. | Intermittent PageServer page-read failures on paths that read CHKP_NUM sys tree leaves. | OPEN, UPSTREAM | File bug; for now, avoid code paths that force reads on this block from backend context at restart. |
+| R21 | In-memory root after restart | `create_shared_root_info` allocates a fresh in-memory root page for every tree during `checkpointable_tree_init`. Meta-page gets `rootDownlink` from disk via Plan E, but the root-page *content* is not pre-loaded from disk. Btree walks use the in-memory page directly. Hypothesis: walks do not trigger a disk read to hydrate the root if the in-memory page is "valid but empty". Needs verification. | Restart backends see empty trees even though PageServer has chkp=3 FPIs. | HYPOTHESIS | Instrument btree walk's root-page hydration; fix so first walk after restart triggers `btree_smgr_read` via `rootDownlink`. Subset of N2 infrastructure. |
 
 ---
 
@@ -338,3 +341,18 @@ starts.
 - **2026-04-19 r3** (*pending*): Update after the first N2 spike lands
   — measured WAL amp under `test_e2e_crud.sh`. If amp > 2× PG heap,
   revisit N2.6 sizing.
+- **2026-04-19 r4**: N1 diagnostic triangle landed (commits 3a00f1a,
+  8154109, b6a8581, 8c1c60a). Root-cause of 6.6.4c-3 refined: the
+  chain is NOT "signal missing → no replay" but more subtle —
+  `SYS_TREES_CHKP_NUM` preserves the (5,16476)=3 entry,
+  `o_get_latest_chkp_num` returns 3, the map file at chkp=3 exists on
+  PageServer, yet backend-side `SELECT count` returns 0. Hypothesis
+  (R21): `create_shared_root_info` allocates an empty in-memory root
+  that walks use directly without triggering a disk read via
+  `rootDownlink`. First attempt to force EOR FPI emission (4b58e2a,
+  bypass inner dirty-flag skip) regressed Plan E by triggering the
+  pre-existing wal-redo SEGV on SYS_TREES_CHKP_NUM block 1 (R20) —
+  reverted in c1a34ba. Added R19 (EOR skip-on-clean), R20 (wal-redo
+  SEGV), R21 (empty in-memory root). N2 (commit-barrier data page
+  FPIs) is now the correct enterprise fix — making data authoritative
+  on PageServer at commit time sidesteps R19, R20, R21 simultaneously.
