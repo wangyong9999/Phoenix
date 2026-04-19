@@ -5823,6 +5823,26 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 													   DOWNLINK_GET_DISK_OFF(file_header.rootDownlink)))));
 		}
 
+		/*
+		 * Phase 6.6.4c diagnostic: log the result of the root-page load.
+		 * Non-zero n_items in the root indicates we loaded real content from
+		 * PageServer via rootDownlink; 0 n_items means we hit the empty/
+		 * zero-filled path (R21 hypothesis confirmed).
+		 */
+		{
+			BTreePageHeader *header = (BTreePageHeader *) buf;
+
+			elog(LOG, "evictable_tree_init_meta: (%u, %u) root loaded "
+				 "downlink=0x%lx off=%lu changeCount=%u "
+				 "first-8bytes=0x%016lx",
+				 desc->oids.datoid, desc->oids.relnode,
+				 (unsigned long) file_header.rootDownlink,
+				 (unsigned long) DOWNLINK_GET_DISK_OFF(file_header.rootDownlink),
+				 O_PAGE_GET_CHANGE_COUNT((Page) buf),
+				 *((uint64 *) buf));
+			(void) header;
+		}
+
 		put_page_image(desc->rootInfo.rootPageBlkno, buf);
 		CLEAN_DIRTY(desc->ppool, desc->rootInfo.rootPageBlkno);
 		if (!*evicted_data)
