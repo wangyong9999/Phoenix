@@ -1783,6 +1783,16 @@ impl ComputeNode {
                 } else {
                     let signal_path = pgdata_path.join("orioledb_recovery.signal");
                     std::fs::write(&signal_path, sync_lsn_trimmed)?;
+                    // Post-write verification: re-stat and abort if missing.
+                    // Any race that loses the signal file must surface here,
+                    // not later as count=0 post-restart.
+                    if !signal_path.exists() {
+                        anyhow::bail!(
+                            "OrioleDB recovery: signal file {} vanished after \
+                             write — aborting to avoid silent data loss",
+                            signal_path.display()
+                        );
+                    }
                     tracing::error!(
                         "OrioleDB recovery: signal written to {} (lsn={})",
                         signal_path.display(),
