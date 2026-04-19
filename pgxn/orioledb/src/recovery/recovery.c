@@ -759,6 +759,22 @@ orioledb_redo(XLogReaderState *record)
 	bool		recovery_single;
 
 	/*
+	 * Diagnostic: log first call so CI surfaces whether WAL replay ever
+	 * dispatches any OrioleDB record on post-crash restart. Static flag
+	 * so we don't spam.
+	 */
+	{
+		static bool logged = false;
+		if (!logged)
+		{
+			uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+			elog(LOG, "orioledb_redo: first dispatch LSN=%X/%X info=0x%x",
+				 LSN_FORMAT_ARGS(record->ReadRecPtr), info);
+			logged = true;
+		}
+	}
+
+	/*
 	 * Dispatch page-level WAL records to dedicated redo functions.
 	 * These are self-contained page deltas (like PG nbtxlog) that don't
 	 * need B-tree context. FPI-based records never reach here (handled
