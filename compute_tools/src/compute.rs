@@ -1748,6 +1748,26 @@ impl ComputeNode {
                 endpoint_dir.display(),
                 sync_lsn_file.display()
             );
+            // File-based diagnostic: tracing::error! does not reliably reach
+            // compute.log in CI dumps, so mirror the branch to a plain
+            // append-only log inside endpoint_dir (which survives pgdata
+            // wipes) for offline inspection.
+            {
+                use std::io::Write;
+                let diag_path = endpoint_dir.join(".orioledb_recovery_diag.log");
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true).append(true).open(&diag_path)
+                {
+                    let _ = writeln!(
+                        f,
+                        "[{}] recovery_check: has_orioledb={} sync_lsn_present={} \
+                         pgdata={} sync_lsn={}",
+                        chrono::Utc::now().to_rfc3339(),
+                        has_orioledb, sync_lsn_present,
+                        pgdata_path.display(), sync_lsn_file.display()
+                    );
+                }
+            }
 
             if sync_lsn_present {
                 // Copy SafeKeeper WAL files to pg_wal/ for replay
@@ -1798,6 +1818,23 @@ impl ComputeNode {
                         signal_path.display(),
                         sync_lsn_trimmed
                     );
+                    // File-based diagnostic mirror (see above).
+                    {
+                        use std::io::Write;
+                        let diag_path = endpoint_dir.join(".orioledb_recovery_diag.log");
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true).append(true).open(&diag_path)
+                        {
+                            let _ = writeln!(
+                                f,
+                                "[{}] signal_written: path={} lsn={} size_ok={}",
+                                chrono::Utc::now().to_rfc3339(),
+                                signal_path.display(),
+                                sync_lsn_trimmed,
+                                signal_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+                            );
+                        }
+                    }
 
                     // Phase 6.6.4c: force orioledb.skip_unmodified_trees=false
                     // only for this stateless-restart boot, so the
