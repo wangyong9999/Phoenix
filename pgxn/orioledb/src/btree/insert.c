@@ -1176,6 +1176,20 @@ o_btree_insert_item_no_waiters(BTreeInsertStackItem *insert_item,
 					BTREE_PAGE_GET_ITEM_SIZE(p, &loc));
 			}
 		}
+		else
+		{
+			/*
+			 * R22 fix — internal page downlink insertion after a child
+			 * split. Without emitting a WAL FPI here, PageServer's copy
+			 * of this parent stays pre-split; post-crash backends walking
+			 * from a stale parent skip the right-side children created
+			 * by the post-checkpoint splits. This is the (non-root) side
+			 * of the coverage; root split is handled by
+			 * `o_btree_finish_root_split_internal` via
+			 * `orioledb_page_wal_split`.
+			 */
+			orioledb_page_wal_emit_fpi(desc, blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
+		}
 
 		o_btree_insert_mark_split_finished_if_needed(insert_item);
 		unlock_page(blkno);

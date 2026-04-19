@@ -104,7 +104,9 @@ met and a regression test is in CI.
 | R18 | Ordering at commit | Barrier items (undo, CSN, data pages) must all be in WAL **before** `XACT_COMMIT` is flushed. Crashes between barrier-emit and XLogFlush are safe (rollback), crashes between different barrier items are safe only because all are in the same WAL stream flushed atomically by `XLogFlush(commit_lsn)`. | Split-brain if XACT_COMMIT is flushed while a barrier item is still buffered. | ANALYSED — relies on PG's `XLogFlush(commit_lsn)` atomicity. Documented. | Design invariant baked into N2 |
 | R19 | EOR skip-on-clean | `checkpoint_tables_callback`'s inner `if (!dirtyFlag1 && !dirtyFlag2) skip=true` fires for every user tree untouched by the current session. When end-of-recovery runs after a restart where replay has NOT marked trees dirty, every user tree is skipped — no FPI, no map_write, no `o_update_latest_chkp_num`. Bypassing this inner skip is NOT safe: forcing a walk re-reads blocks via Neon smgr which exposes the PageServer wal-redo SEGV on `SYS_TREES_CHKP_NUM` block 1 (R20). | Data loss at count=0 even when SYS_TREES_CHKP_NUM and map files are intact. | CONFIRMED via CI 24621394503 diag. | Root fix is N2 (commit-barrier data page FPIs); dirty-flag skip becomes moot once data is authoritative on PageServer. Regression workaround attempted in 4b58e2a was reverted in c1a34ba. |
 | R20 | wal-redo SEGV on SYS_TREES_CHKP_NUM block 1 | Observed PageServer wal-redo process crash (SIGSEGV) when asked to materialize rel 1663/1/21 block 1 at specific LSN. Upstream or OrioleDB rmgr bug in the wal-redo path for this relation's leaf page. | Intermittent PageServer page-read failures on paths that read CHKP_NUM sys tree leaves. | OPEN, UPSTREAM | File bug; for now, avoid code paths that force reads on this block from backend context at restart. |
-| R21 | In-memory root after restart | `create_shared_root_info` allocates a fresh in-memory root page for every tree during `checkpointable_tree_init`. Meta-page gets `rootDownlink` from disk via Plan E, but the root-page *content* is not pre-loaded from disk. Btree walks use the in-memory page directly. Hypothesis: walks do not trigger a disk read to hydrate the root if the in-memory page is "valid but empty". Needs verification. | Restart backends see empty trees even though PageServer has chkp=3 FPIs. | HYPOTHESIS | Instrument btree walk's root-page hydration; fix so first walk after restart triggers `btree_smgr_read` via `rootDownlink`. Subset of N2 infrastructure. |
+| R21 | In-memory root after restart | `create_shared_root_info` allocates a fresh in-memory root page for every tree during `checkpointable_tree_init`. Meta-page gets `rootDownlink` from disk via Plan E, but the root-page *content* is not pre-loaded from disk. Btree walks use the in-memory page directly. Hypothesis: walks do not trigger a disk read to hydrate the root if the in-memory page is "valid but empty". Needs verification. | Restart backends see empty trees even though PageServer has chkp=3 FPIs. | REFUTED — `evictable_tree_init_meta` does call `read_page_from_disk(rootDownlink)` at line 5815 and `put_page_image` at 5826, so root IS hydrated. | — |
+| R22 | Post-split parent FPI gap | `orioledb_page_wal_split` emits FPIs for the two resulting pages (left/right). The PARENT's downlink-insertion — done by the caller via a normal btree write after the split returns — uses a different WAL path. For internal parent pages, our LEAF_INSERT FPI shim doesn't cover this path. PageServer's parent image stays pre-split; backends walking from a stale parent miss the post-split children's rows. Depth-chained splits make the gap propagate up to root. | 6.6.4c-3 count=0: post-chkp=3 splits update root in memory but not on PageServer; backend reads stale root and misses new leaves. | CONFIRMED via process-of-elimination once R21 was refuted. | Extend `orioledb_page_wal_split` to emit FPI for parent too, and/or add explicit page-level WAL for internal-page downlink inserts. Scoped extension of N2. |
+| R23 | Diag interpretation error | My evictable_tree_init_meta diag read `*(uint64*)buf` hoping to capture the first-page bytes, but line 1583 zeros that region *before* my log fires. The zeroes we saw were the intentional `o_header.state` / `o_header.pageChangeCount` wipe, not "PageServer returned an empty page". R21 was inferred from this misread data. | Wasted one CI round. | MITIGATED — record the lesson so future diag picks fields *after* byte 16 (e.g., itemsCount at offset 50). | — |
 
 ---
 
@@ -356,3 +358,34 @@ starts.
   SEGV), R21 (empty in-memory root). N2 (commit-barrier data page
   FPIs) is now the correct enterprise fix — making data authoritative
   on PageServer at commit time sidesteps R19, R20, R21 simultaneously.
+- **2026-04-19 r5**: N2 first-cut shipped (commit becc24f: LEAF_INSERT
+  / LEAF_DELETE / LEAF_UPDATE emit `REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT`).
+  Plan E stays green, crash test still count=0. New learnings:
+
+  **R22 — structural updates after SPLIT aren't covered by LEAF_INSERT
+  FPI.** A SPLIT emits FPIs for the two resulting pages (left/right)
+  via `orioledb_page_wal_split`, but the PARENT page's downlink
+  insertion (done by the caller via a normal btree write) uses a
+  different path. If the parent is an internal page rather than a
+  leaf, our `orioledb_page_wal_leaf_insert` FPI bypass doesn't fire
+  and PageServer's parent image stays stale. Post-crash, backend
+  walks from an out-of-date root that doesn't know about the
+  post-chkp=3 splits' new children → misses rows in the new leaves.
+  Fix: `orioledb_page_wal_split` needs to also emit FPI for the
+  parent page, and internal-page downlink inserts need their own
+  page-level FPI path (or reuse LEAF_INSERT's if the layout matches).
+  Depth-chained splits must propagate FPIs up to root.
+
+  **R23 — evictable_tree_init_meta diag reads only zeroed header.**
+  Line 1583 (`memset(img, 0, O_PAGE_HEADER_SIZE)`) intentionally
+  zeros the first 16 bytes after `check_orioledb_page_version`
+  passes, then writes `o_header.checkpointNum` at bytes 12-15. Our
+  diag read `*(uint64*)buf` captured those zeroed bytes, not the
+  meaningful page content (which starts at byte 16). Diag data was
+  inconclusive; plan next probe to read `itemsCount` at byte offset
+  50 instead.
+
+  Next step: verify R22 hypothesis by instrumenting post-split
+  parent-page update site, then add FPI emission for parent writes
+  (covers internal-page structure updates generally). This is a
+  scoped extension of N2, not a separate phase.
