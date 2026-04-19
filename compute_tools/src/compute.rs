@@ -1735,6 +1735,17 @@ impl ComputeNode {
             let endpoint_dir = pgdata_path.parent().unwrap_or(pgdata_path);
             let was_initialized = endpoint_dir.join(".orioledb_initialized").exists();
 
+            // Phase 6.6.4c diagnostics — error!() level so it survives any
+            // tracing filter and is visible in the CI log.
+            tracing::error!(
+                "OrioleDB recovery check: has_orioledb={} was_initialized={} \
+                 endpoint_dir={} marker_path={}",
+                has_orioledb,
+                was_initialized,
+                endpoint_dir.display(),
+                endpoint_dir.join(".orioledb_initialized").display()
+            );
+
             if has_orioledb && was_initialized {
                 // Copy SafeKeeper WAL files to pg_wal/ for replay
                 if let (Some(tid), Some(tlid)) = (spec.tenant_id, spec.timeline_id) {
@@ -1769,7 +1780,11 @@ impl ComputeNode {
                 } else {
                     let signal_path = pgdata_path.join("orioledb_recovery.signal");
                     std::fs::write(&signal_path, sync_lsn_trimmed)?;
-                    info!("OrioleDB recovery: redo from {}", sync_lsn_trimmed);
+                    tracing::error!(
+                        "OrioleDB recovery: signal written to {} (lsn={})",
+                        signal_path.display(),
+                        sync_lsn_trimmed
+                    );
 
                     // Phase 6.6.4c: force orioledb.skip_unmodified_trees=false
                     // only for this stateless-restart boot, so the

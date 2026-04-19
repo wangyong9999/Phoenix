@@ -54,6 +54,8 @@
 #include "access/heapam.h"
 #include "access/table.h"
 #include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"
+#include "storage/smgr.h"
 #include "catalog/pg_enum.h"
 #include "executor/execExpr.h"
 #include "funcapi.h"
@@ -1471,6 +1473,26 @@ orioledb_shmem_startup(void)
 	LWLockRelease(AddinShmemInitLock);
 
 	shared_segment_initialized = true;
+
+	/*
+	 * Phase 6.6.4c diagnostics — fire exactly once per postmaster startup
+	 * so CI logs reveal effective recovery config before any backend runs.
+	 */
+	{
+		struct stat st;
+		bool		signal_exists = (stat("orioledb_recovery.signal", &st) == 0);
+		bool		initialized_exists = (stat("../.orioledb_initialized", &st) == 0);
+		bool		sync_lsn_exists = (stat("../.orioledb_sync_lsn", &st) == 0);
+
+		elog(LOG, "OrioleDB startup diagnostics: "
+			 "skip_unmodified_trees=%d recovery_requested=%d "
+			 "signal_file=%d initialized_marker=%d sync_lsn=%d "
+			 "smgr_hook=%s",
+			 skip_unmodified_trees,
+			 IsOrioleDbRecoveryRequested(),
+			 signal_exists, initialized_exists, sync_lsn_exists,
+			 smgr_hook != NULL ? "set" : "null");
+	}
 }
 
 uint64

@@ -47,6 +47,7 @@
 
 #include "access/transam.h"
 #include "access/relation.h"
+#include "access/xlog.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "access/xloginsert.h"
@@ -81,7 +82,13 @@ orioledb_neon_io_check(void)
 	if (smgr_hook != NULL)
 	{
 		neon_io_enabled = true;
-		elog(LOG, "OrioleDB: Neon detected — page images will be sent via WAL");
+		elog(LOG, "OrioleDB: Neon detected — page images will be sent via WAL "
+			 "(skip_unmodified_trees=%d recovery_requested=%d "
+			 "recovery_in_progress=%d startup=%d)",
+			 skip_unmodified_trees,
+			 IsOrioleDbRecoveryRequested(),
+			 RecoveryInProgress(),
+			 AmStartupProcess());
 	}
 }
 
