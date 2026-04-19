@@ -5109,6 +5109,8 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 
 	if (!check_tree_needs_checkpointing(type, treeOids))
 	{
+		elog(LOG, "checkpoint_tables_callback: (%u, %u) skip — tree_needs=no",
+			 treeOids.datoid, treeOids.relnode);
 		MemoryContextSwitchTo(prev_context);
 		MemoryContextResetOnly(chkp_tree_context);
 		return;
@@ -5124,6 +5126,9 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 	descr = o_fetch_index_descr(treeOids, type, true, NULL);
 	if (descr != NULL)
 		loaded = o_btree_load_shmem_checkpoint(&descr->desc);
+	elog(LOG, "checkpoint_tables_callback: (%u, %u) descr=%s loaded=%d",
+		 treeOids.datoid, treeOids.relnode,
+		 descr ? "yes" : "null", loaded);
 	if (loaded)
 	{
 		BTreeDescr *td = &descr->desc;
