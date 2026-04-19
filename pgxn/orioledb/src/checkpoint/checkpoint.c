@@ -5824,23 +5824,27 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 		}
 
 		/*
-		 * Phase 6.6.4c diagnostic: log the result of the root-page load.
-		 * Non-zero n_items in the root indicates we loaded real content from
-		 * PageServer via rootDownlink; 0 n_items means we hit the empty/
-		 * zero-filled path (R21 hypothesis confirmed).
+		 * Phase 6.6.4c diagnostic: log the REAL content of the root page
+		 * after load. BTreePageHeader.itemsCount is the authoritative
+		 * "this page has N items" field; 0 means the page is empty.
+		 * Also log checkpointNum (already preserved at bytes 12-15 by
+		 * the memset+set sequence in read_page_from_disk) to see which
+		 * chkp's content we're looking at.
 		 */
 		{
 			BTreePageHeader *header = (BTreePageHeader *) buf;
 
 			elog(LOG, "evictable_tree_init_meta: (%u, %u) root loaded "
-				 "downlink=0x%lx off=%lu changeCount=%u "
-				 "first-8bytes=0x%016lx",
+				 "downlink=0x%lx off=%lu chkpNum=%u itemsCount=%u "
+				 "chunksCount=%u dataSize=%u level=%u",
 				 desc->oids.datoid, desc->oids.relnode,
 				 (unsigned long) file_header.rootDownlink,
 				 (unsigned long) DOWNLINK_GET_DISK_OFF(file_header.rootDownlink),
-				 O_PAGE_GET_CHANGE_COUNT((Page) buf),
-				 *((uint64 *) buf));
-			(void) header;
+				 header->o_header.checkpointNum,
+				 header->itemsCount,
+				 header->chunksCount,
+				 header->dataSize,
+				 PAGE_GET_LEVEL((Page) buf));
 		}
 
 		put_page_image(desc->rootInfo.rootPageBlkno, buf);
