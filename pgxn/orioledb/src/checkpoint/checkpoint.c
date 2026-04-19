@@ -5167,18 +5167,44 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 		checkpoint_ix_init_state(checkpoint_state, td);
 		checkpoint_init_new_seq_bufs(td, chkpNum);
 
+		/*
+		 * Phase 6.6.4c / N1 — when the operator (compute_tools on Neon
+		 * stateless restart) requests `skip_unmodified_trees=false`, honour
+		 * the request all the way down. Without this, the outer
+		 * check_tree_needs_checkpointing bypass succeeds but the inner
+		 * "clean dirty flags ⇒ skip" still fires for every user tree the
+		 * restart touched before any backend dirtied it, so no FPI gets
+		 * emitted, no map_write_header runs, and SYS_TREES_CHKP_NUM is
+		 * never updated for the tree. Subsequent backends land on a
+		 * freshly-init'd empty shmem root and return count=0.
+		 *
+		 * Forcing `skip=false` here re-emits the tree as chkp=N+1 with the
+		 * content we lazy-loaded from PageServer (chkp=N FPIs) during the
+		 * walk, which is both correct and idempotent. Cost is a one-time
+		 * O(user-data) FPI volume on stateless restart, acceptable because
+		 * the GUC is only set while orioledb_recovery.signal is in effect.
+		 */
 		if (!meta->dirtyFlag1 && !meta->dirtyFlag2)
 		{
 			chkp_inc_changecount_before(checkpoint_state);
 			if (!meta->dirtyFlag1 && !meta->dirtyFlag2)
 			{
-				checkpoint_state->treeType = td->type;
-				checkpoint_state->datoid = td->oids.datoid;
-				checkpoint_state->reloid = td->oids.reloid;
-				checkpoint_state->relnode = td->oids.relnode;
-				checkpoint_state->completed = true;
-				checkpoint_state->curKeyType = CurKeyFinished;
-				skip = true;
+				if (skip_unmodified_trees)
+				{
+					checkpoint_state->treeType = td->type;
+					checkpoint_state->datoid = td->oids.datoid;
+					checkpoint_state->reloid = td->oids.reloid;
+					checkpoint_state->relnode = td->oids.relnode;
+					checkpoint_state->completed = true;
+					checkpoint_state->curKeyType = CurKeyFinished;
+					skip = true;
+				}
+				else
+				{
+					elog(LOG, "checkpoint_tables_callback: (%u, %u) "
+						 "dirty-flag skip bypassed (skip_unmodified_trees=false)",
+						 treeOids.datoid, treeOids.relnode);
+				}
 			}
 			chkp_inc_changecount_after(checkpoint_state);
 		}
