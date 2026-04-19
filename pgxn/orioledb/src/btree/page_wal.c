@@ -277,7 +277,18 @@ orioledb_page_wal_leaf_insert(BTreeDescr *desc, OInMemoryBlkno blkno,
 	xlrec.tuple_size = sizeof(BTreeLeafTuphdr) + tuple_len;
 
 	XLogBeginInsert();
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page, 0);
+	/*
+	 * N2 commit-barrier for data pages: emit FPI on every leaf
+	 * mutation so PageServer has the authoritative post-mutation page
+	 * state. Without this, LEAF_INSERT deltas are stored as WalRecords
+	 * on PageServer that PG's wal-redo cannot apply (rmid=129 is
+	 * OrioleDB's, not PG's), and post-crash backends read empty pages
+	 * for every mutation past the last checkpoint — the root cause of
+	 * 6.6.4c-3 count=0. REGBUF_FORCE_IMAGE makes the WAL record
+	 * self-sufficient; see docs/ENTERPRISE_HARDENING_PLAN.md §N2.
+	 */
+	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page,
+					  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
 	XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafInsert);
 	XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
 	XLogRegisterBufData(0, tuple_data, tuple_len);
@@ -317,7 +328,9 @@ orioledb_page_wal_leaf_delete(BTreeDescr *desc, OInMemoryBlkno blkno,
 	xlrec.undo_loc = tuphdr->undoLocation;
 
 	XLogBeginInsert();
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page, 0);
+	/* N2: FPI per mutation — see LEAF_INSERT for the rationale. */
+	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page,
+					  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
 	XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafDelete);
 	/* Store the full tuphdr for precise state restoration in redo */
 	XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
@@ -359,7 +372,9 @@ orioledb_page_wal_leaf_update(BTreeDescr *desc, OInMemoryBlkno blkno,
 	xlrec.pad = 0;
 
 	XLogBeginInsert();
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page, 0);
+	/* N2: FPI per mutation — see LEAF_INSERT for the rationale. */
+	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page,
+					  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
 	XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafUpdate);
 	XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
 	XLogRegisterBufData(0, tuple_data, tuple_len);
