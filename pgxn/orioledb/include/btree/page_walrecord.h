@@ -169,6 +169,7 @@ IsOrioleDBPageLevelWal(uint8 info)
 		case ORIOLEDB_XLOG_MERGE:
 		case ORIOLEDB_XLOG_ROOT_SPLIT:
 		case ORIOLEDB_XLOG_UNDO_APPLY:
+		case ORIOLEDB_XLOG_PAGE_IMAGE:
 			return true;
 		default:
 			return false;
