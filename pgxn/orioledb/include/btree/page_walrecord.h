@@ -35,16 +35,43 @@
  *
  * New page-level delta types use 0x10-0xA0 range.
  */
-#define ORIOLEDB_XLOG_PAGE_INIT		0x10	/* new empty page (WILL_INIT) */
+/*
+ * Emission status notes (M1.1 audit):
+ *
+ *   Actively emitted (covered by N2 commit-barrier):
+ *     0x20 LEAF_INSERT   — insert.c via orioledb_page_wal_leaf_insert
+ *     0x30 LEAF_DELETE   — modify.c via orioledb_page_wal_leaf_delete
+ *     0x40 LEAF_UPDATE   — insert.c via orioledb_page_wal_leaf_update
+ *     0x60 COMPACT       — insert.c via orioledb_page_wal_emit_fpi
+ *     0x70 SPLIT         — split.c / insert.c via orioledb_page_wal_split
+ *     0x80 MERGE         — merge.c via orioledb_page_wal_merge
+ *     0x81 PAGE_IMAGE    — io.c (Plan E checkpoint FPI) + insert.c (R22 non-leaf)
+ *     0xA0 UNDO_APPLY    — modify.c via orioledb_page_wal_emit_fpi
+ *
+ *   Reserved, not currently emitted ("dead" types; kept for future
+ *   delta-WAL extension. Handlers are no-ops because any modification
+ *   they would represent is already covered by one of the above; e.g.
+ *   a page init without content is a degenerate LEAF_INSERT on an
+ *   empty page, and a lock change is a tuphdr flag update that hasn't
+ *   been deemed visible across the crash boundary):
+ *     0x10 PAGE_INIT     — reserved
+ *     0x50 LEAF_LOCK     — reserved
+ *     0x90 ROOT_SPLIT    — reserved (root split reuses SPLIT via
+ *                         o_btree_finish_root_split_internal)
+ *
+ * See ENTERPRISE_HARDENING_PLAN.md M1.1 for the rationale behind
+ * keeping but not emitting these.
+ */
+#define ORIOLEDB_XLOG_PAGE_INIT		0x10	/* reserved, not emitted */
 #define ORIOLEDB_XLOG_LEAF_INSERT	0x20	/* insert tuple into leaf */
 #define ORIOLEDB_XLOG_LEAF_DELETE	0x30	/* mark tuple deleted on leaf */
 #define ORIOLEDB_XLOG_LEAF_UPDATE	0x40	/* replace tuple on leaf */
-#define ORIOLEDB_XLOG_LEAF_LOCK		0x50	/* update lock flags on tuple */
+#define ORIOLEDB_XLOG_LEAF_LOCK		0x50	/* reserved, not emitted */
 #define ORIOLEDB_XLOG_COMPACT		0x60	/* page compaction (FPI) */
 #define ORIOLEDB_XLOG_SPLIT			0x70	/* page split (2-3 FPIs) */
 #define ORIOLEDB_XLOG_MERGE			0x80	/* page merge (FPI+delta) */
-/*      ORIOLEDB_XLOG_PAGE_IMAGE	0x81	   (existing — checkpoint FPI) */
-#define ORIOLEDB_XLOG_ROOT_SPLIT	0x90	/* root split (3 FPIs) */
+/*      ORIOLEDB_XLOG_PAGE_IMAGE	0x81	   (existing — Plan E + R22 FPI) */
+#define ORIOLEDB_XLOG_ROOT_SPLIT	0x90	/* reserved, not emitted */
 #define ORIOLEDB_XLOG_UNDO_APPLY	0xA0	/* undo rollback (FPI) */
 
 /*
