@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use bytes::{Bytes, BytesMut};
-use pageserver_api::key::{CompactKey, Key, rel_block_to_key, orioledb_wal_key};
+use pageserver_api::key::{CompactKey, Key, rel_block_to_key};
 use pageserver_api::keyspace::KeySpace;
 use pageserver_api::reltag::RelTag;
 use pageserver_api::shard::ShardIdentity;
@@ -199,14 +199,11 @@ impl SerializedValueBatch {
                 // in this case. Also some FPI records may contain multiple (up to 32) pages,
                 // so them have to be copied multiple times.
                 //
-                // OrioleDB (rmid=129) page-level WAL:
-                //   FPI records (REGBUF_FORCE_IMAGE): stored as Value::Image (below)
-                //   Delta records (LEAF_INSERT/DELETE/UPDATE): stored as
-                //     Value::WalRecord for wal-redo to apply via orioledb_page_redo()
-                //
-                // Old row-level OrioleDB WAL (ORIOLEDB_XLOG_CONTAINER, info=0x00)
-                // has NO block refs, so this path is only hit by the new
-                // page-level delta records (info >= 0x10).
+                // OrioleDB (rmid=129) records flow through the same block-keyed
+                // path as PG rmgrs. FPIs with an attached image become
+                // Value::Image; delta records (LEAF_INSERT/DELETE/UPDATE) become
+                // Value::WalRecord and are replayed on GetPage by walredo via
+                // the orioledb.so light-mode loaded in pgxn/neon_walredo/walredoproc.c.
 
                 let val = if Self::block_is_image(&decoded, blk, pg_version) {
                     // Extract page image from FPI record
@@ -268,43 +265,6 @@ impl SerializedValueBatch {
             }
         }
 
-        // OrioleDB WAL records: store as relation-level stream regardless of
-        // whether the record carries block references — PG walredo can't
-        // replay rmid=129, so we don't associate the record with any page.
-        // Non-FPI OrioleDB block refs are already skipped in the block loop
-        // above; this path captures every rmid=129 record end-to-end.
-        if decoded.xl_rmid == 129 {
-            let key = orioledb_wal_key(next_record_lsn.0);
-
-            let val = Value::WalRecord(NeonWalRecord::Postgres {
-                will_init: true,
-                rec: decoded.record.clone(),
-            });
-
-            for (_shard, record) in shard_records.iter_mut() {
-                let relative_off = record.batch.raw.len() as u64;
-                val.ser_into(&mut record.batch.raw)
-                    .expect("Writing into in-memory buffer is infallible");
-                let val_ser_size = record.batch.raw.len() - relative_off as usize;
-
-                record
-                    .batch
-                    .metadata
-                    .push(ValueMeta::Serialized(SerializedValueMeta {
-                        key: key.to_compact(),
-                        lsn: next_record_lsn,
-                        batch_offset: relative_off,
-                        len: val_ser_size,
-                        will_init: true,
-                    }));
-                record.batch.max_lsn = std::cmp::max(record.batch.max_lsn, next_record_lsn);
-                record.batch.len += 1;
-
-                // Only store on shard 0
-                break;
-            }
-        }
-
         if cfg!(any(debug_assertions, test)) {
             // Validate that the batches are correct
             for record in shard_records.values() {
@@ -351,11 +311,6 @@ impl SerializedValueBatch {
                 // length of the raw record
                 estimate += 8 + 1 + 8 + decoded.record.len();
             }
-        }
-
-        // OrioleDB WAL records (no blocks)
-        if decoded.blocks.is_empty() && decoded.xl_rmid == 129 {
-            estimate += 8 + 1 + 8 + decoded.record.len();
         }
 
         estimate
@@ -945,14 +900,14 @@ mod tests {
     }
 
     /// OrioleDB FPI (ORIOLEDB_RMGR_ID = 129) round-trip: feed a
-    /// hand-built DecodedWALRecord into from_decoded_filtered and
-    /// verify that
+    /// hand-built DecodedWALRecord with an attached page image into
+    /// from_decoded_filtered and verify that
     ///   1. the block produces a Value::Image under rel_block_to_key,
-    ///   2. the full record is mirrored as a Value::WalRecord at
-    ///      orioledb_wal_key(lsn),
-    ///   3. page_set_lsn is NOT applied — OrioleDB pages carry an
+    ///   2. page_set_lsn is NOT applied — OrioleDB pages carry an
     ///      OrioleDBPageHeader at offset 0, so overwriting the first
-    ///      8 bytes with a PG LSN would corrupt the state field.
+    ///      8 bytes with a PG LSN would corrupt the state field,
+    ///   3. no side-channel entry is produced — rmid=129 records flow
+    ///      exclusively through the block-keyed path.
     #[test]
     fn test_orioledb_fpi_round_trip() {
         use crate::models::FlushUncommittedRecords;
@@ -1016,7 +971,7 @@ mod tests {
         .unwrap();
 
         let batch = shard_records.remove(&shard).unwrap().batch;
-        assert_eq!(batch.len, 2, "expected FPI image + WAL-stream entry");
+        assert_eq!(batch.len, 1, "expected a single block-keyed FPI entry");
         assert_eq!(batch.max_lsn, LSN);
 
         let rel = RelTag {
@@ -1026,56 +981,133 @@ mod tests {
             forknum: 0,
         };
         let block_key = rel_block_to_key(rel, BLKNO).to_compact();
-        let wal_key = orioledb_wal_key(LSN.0).to_compact();
 
-        let mut saw_image = false;
-        let mut saw_wal_record = false;
-        for meta in &batch.metadata {
-            let ser = match meta {
-                ValueMeta::Serialized(s) => s,
-                ValueMeta::Observed(_) => panic!("did not expect observed entries"),
-            };
-            let start = ser.batch_offset as usize;
-            let val = Value::des(&batch.raw[start..start + ser.len]).unwrap();
+        let ser = match &batch.metadata[0] {
+            ValueMeta::Serialized(s) => s,
+            ValueMeta::Observed(_) => panic!("did not expect observed entries"),
+        };
+        assert_eq!(ser.key, block_key, "FPI must land at rel_block_to_key");
+        assert_eq!(ser.lsn, LSN);
 
-            if ser.key == block_key {
-                let img = match val {
-                    Value::Image(b) => b,
-                    other => panic!("expected Value::Image at block key, got {other:?}"),
-                };
-                assert_eq!(img.len(), BLCKSZ as usize);
-                assert_eq!(
-                    &img[0..8],
-                    &page[0..8],
-                    "page_set_lsn leaked into rmid=129 path — would corrupt OrioleDBPageHeader"
-                );
-                assert_eq!(img[2048], 0x42);
-                assert_eq!(img[BLCKSZ as usize - 1], 0xFF);
-                saw_image = true;
-            } else if ser.key == wal_key {
-                match val {
-                    Value::WalRecord(NeonWalRecord::Postgres { will_init, rec }) => {
-                        assert!(will_init, "OrioleDB WAL-stream entries must init");
-                        assert_eq!(rec.as_ref(), record_bytes.as_ref());
-                        saw_wal_record = true;
-                    }
-                    other => {
-                        panic!("expected Postgres WalRecord at WAL key, got {other:?}")
-                    }
-                }
-            } else {
-                panic!("unexpected key in batch: {}", Key::from_compact(ser.key));
-            }
-        }
-        assert!(saw_image, "FPI page image missing from batch");
-        assert!(saw_wal_record, "OrioleDB WAL-stream record missing from batch");
+        let start = ser.batch_offset as usize;
+        let val = Value::des(&batch.raw[start..start + ser.len]).unwrap();
+        let img = match val {
+            Value::Image(b) => b,
+            other => panic!("expected Value::Image, got {other:?}"),
+        };
+        assert_eq!(img.len(), BLCKSZ as usize);
+        assert_eq!(
+            &img[0..8],
+            &page[0..8],
+            "page_set_lsn leaked into rmid=129 path — would corrupt OrioleDBPageHeader"
+        );
+        assert_eq!(img[2048], 0x42);
+        assert_eq!(img[BLCKSZ as usize - 1], 0xFF);
     }
 
-    /// OrioleDB delta / container records carry no block refs. They
-    /// must still land in the WAL-stream key space unconditionally so
-    /// wal-redo can replay the tree-level log on GetPage.
+    /// OrioleDB delta record (block ref, no image): must land as
+    /// Value::WalRecord at rel_block_to_key(lsn), so walredo can
+    /// replay it on top of a prior Value::Image base.
+    ///
+    /// This is the main-path routing contract for B-phase: once
+    /// page_wal.c stops forcing FPIs on every mutation, the same
+    /// DecodedBkpBlock shape (has_image=false, apply_image=false)
+    /// will be emitted for LEAF_INSERT/DELETE/UPDATE and must reach
+    /// PageServer's per-page stream untouched.
     #[test]
-    fn test_orioledb_record_without_blocks() {
+    fn test_orioledb_delta_routes_to_block_key() {
+        use crate::models::FlushUncommittedRecords;
+
+        const LSN: Lsn = Lsn(0x3000);
+        const SPC: u32 = 1663;
+        const DB: u32 = 24577;
+        const REL: u32 = 24578;
+        const BLKNO: u32 = 11;
+
+        let record_bytes = Bytes::from_static(b"\xAA\xBB\xCC opaque delta payload");
+
+        let mut block = DecodedBkpBlock::new();
+        block.rnode_spcnode = SPC;
+        block.rnode_dbnode = DB;
+        block.rnode_relnode = REL;
+        block.forknum = 0;
+        block.blkno = BLKNO;
+        block.has_image = false;
+        block.apply_image = false;
+        block.will_init = false;
+
+        let decoded = DecodedWALRecord {
+            xl_xid: 17,
+            xl_info: 0x10,
+            xl_rmid: 129,
+            record: record_bytes.clone(),
+            blocks: vec![block],
+            main_data_offset: 0,
+            origin_id: 0,
+        };
+
+        let shard = ShardIdentity::unsharded();
+        let mut shard_records: HashMap<ShardIdentity, InterpretedWalRecord> = HashMap::new();
+        shard_records.insert(
+            shard,
+            InterpretedWalRecord {
+                metadata_record: None,
+                batch: SerializedValueBatch::default(),
+                next_record_lsn: LSN,
+                flush_uncommitted: FlushUncommittedRecords::No,
+                xid: 17,
+            },
+        );
+
+        SerializedValueBatch::from_decoded_filtered(
+            decoded,
+            &mut shard_records,
+            LSN,
+            PgMajorVersion::PG17,
+        )
+        .unwrap();
+
+        let batch = shard_records.remove(&shard).unwrap().batch;
+        assert_eq!(
+            batch.len, 1,
+            "delta record must produce exactly one block-keyed entry"
+        );
+        assert_eq!(batch.max_lsn, LSN);
+
+        let rel = RelTag {
+            spcnode: SPC,
+            dbnode: DB,
+            relnode: REL,
+            forknum: 0,
+        };
+        let block_key = rel_block_to_key(rel, BLKNO).to_compact();
+
+        let ser = match &batch.metadata[0] {
+            ValueMeta::Serialized(s) => s,
+            ValueMeta::Observed(_) => panic!("did not expect observed entries"),
+        };
+        assert_eq!(
+            ser.key, block_key,
+            "delta must land at rel_block_to_key, not on a side-channel"
+        );
+        assert_eq!(ser.lsn, LSN);
+
+        let start = ser.batch_offset as usize;
+        let val = Value::des(&batch.raw[start..start + ser.len]).unwrap();
+        match val {
+            Value::WalRecord(NeonWalRecord::Postgres { will_init, rec }) => {
+                assert!(!will_init, "plain delta has neither will_init nor apply_image");
+                assert_eq!(rec.as_ref(), record_bytes.as_ref());
+            }
+            other => panic!("expected Value::WalRecord(Postgres), got {other:?}"),
+        }
+    }
+
+    /// OrioleDB record with no block refs: produces an empty batch.
+    /// Historically we mirrored every rmid=129 record to a
+    /// per-LSN side-channel stream; that path is retired.
+    #[test]
+    fn test_orioledb_record_without_blocks_is_noop() {
         use crate::models::FlushUncommittedRecords;
 
         const LSN: Lsn = Lsn(0x2000);
@@ -1085,7 +1117,7 @@ mod tests {
             xl_xid: 99,
             xl_info: 0x00,
             xl_rmid: 129,
-            record: record_bytes.clone(),
+            record: record_bytes,
             blocks: vec![],
             main_data_offset: 0,
             origin_id: 0,
@@ -1113,25 +1145,8 @@ mod tests {
         .unwrap();
 
         let batch = shard_records.remove(&shard).unwrap().batch;
-        assert_eq!(batch.len, 1);
-        assert_eq!(batch.max_lsn, LSN);
-
-        let meta = match &batch.metadata[0] {
-            ValueMeta::Serialized(s) => s,
-            _ => panic!("serialized expected"),
-        };
-        assert_eq!(meta.key, orioledb_wal_key(LSN.0).to_compact());
-        assert!(meta.will_init);
-
-        let val =
-            Value::des(&batch.raw[meta.batch_offset as usize..][..meta.len]).unwrap();
-        match val {
-            Value::WalRecord(NeonWalRecord::Postgres { will_init, rec }) => {
-                assert!(will_init);
-                assert_eq!(rec.as_ref(), record_bytes.as_ref());
-            }
-            other => panic!("expected WalRecord(Postgres), got {other:?}"),
-        }
+        assert_eq!(batch.len, 0, "block-less rmid=129 must not produce any value");
+        assert!(batch.metadata.is_empty());
     }
 
     /// Phase 6.6.3: LSN externality invariant.

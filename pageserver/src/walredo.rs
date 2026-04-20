@@ -447,18 +447,17 @@ impl PostgresRedoManager {
     ///
     /// Cancellation safe.
     #[allow(clippy::too_many_arguments)]
-    /// Replay a batch of PG-rmid WAL records against a base image.
+    /// Replay a batch of WAL records against a base image.
     ///
-    /// INVARIANT: this function must never see an OrioleDB (rmid=129) record.
-    /// OrioleDB records cannot be replayed by the standard PG walredo helper
-    /// — its RmgrTable has no entry for rmid=129. The WAL decoder in
-    /// `libs/wal_decoder/src/serialized_batch.rs` enforces this by:
-    ///   1. Storing Plan E FPIs (rmid=129 + REGBUF_FORCE_IMAGE) as
-    ///      [`Value::Image`] so no replay is needed.
-    ///   2. Skipping per-block storage for non-image rmid=129 records;
-    ///      the full record is captured in the `orioledb_wal_key` stream
-    ///      which is replayed inside the compute process by OrioleDB's own
-    ///      recovery hook, not here.
+    /// OrioleDB (rmid=129) records flow through the same path. The walredo
+    /// process loads `orioledb.so` in light mode (see
+    /// `pgxn/neon_walredo/walredoproc.c` and the `am_wal_redo_postgres`
+    /// branch in `pgxn/orioledb/src/orioledb.c:_PG_init`), which registers
+    /// a minimal RMGR that dispatches rmid=129 to `orioledb_page_redo`.
+    ///
+    /// In practice, FPI-type rmid=129 records (REGBUF_FORCE_IMAGE or
+    /// page-image records) are materialised as `Value::Image` at decode
+    /// time and never reach this function; only delta records do.
     async fn apply_batch_postgres(
         &self,
         key: Key,
