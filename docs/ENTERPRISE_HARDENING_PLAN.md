@@ -391,12 +391,74 @@ starts.
   parent-page update site, then add FPI emission for parent writes
   (covers internal-page structure updates generally). This is a
   scoped extension of N2, not a separate phase.
-- **2026-04-19 r6**: R22 fix shipped (commit 6249cef: FPI on
-  non-leaf downlink insert). Still count=0 post-crash. R23-corrected
-  diag (commit a5eeec4) showed user table (5, 16476) root loads with
-  `itemsCount=7 chunksCount=7 level=1 chkpNum=3` — root has real
-  structure pointing to 7 leaf children. So the tree is not empty
-  at root level; leaves return empty.
+- **2026-04-20 r7 (session close)**: Additional hardening shipped but
+  6.6.4c-3 count=0 persists. Cumulative state across the investigation:
+
+  **Shipped (in tree)**:
+  - M1.2 — undo commit-barrier flush (oxid.c)
+  - M1.3 — xidmap commit-barrier flush (oxid.c)
+  - N1 helper + unit tests (compute_tools/src/compute.rs)
+  - N1 sync_lsn-gated recovery-signal write (compute_tools)
+  - N1 fsync + post-write verification (compute_tools)
+  - N1 file-based diag log `.orioledb_recovery_diag.log`
+  - N2 first-cut — REGBUF_FORCE_IMAGE|REGBUF_WILL_INIT on
+    LEAF_INSERT / LEAF_DELETE / LEAF_UPDATE (page_wal.c)
+  - R22 — FPI for non-leaf downlink insert (insert.c)
+  - N2 hardening — PAGE_IMAGE info byte in FPI-ignore redo switch
+    and in IsOrioleDBPageLevelWal (page_redo.c, page_walrecord.h)
+  - R22 fire diagnostic (insert.c, limited to first 8 firings)
+  - ENTERPRISE_HARDENING_PLAN.md v1-r7 authoritative long-term plan
+
+  **Reverted**:
+  - 4b58e2a bypass of inner dirty-flag skip (regressed Plan E by
+    triggering R20 wal-redo SEGV on SYS_TREES_CHKP_NUM block 1).
+
+  **Verified via CI diag**:
+  - SYS_TREES_CHKP_NUM preserves (5, 16476)=3 entry across restart
+  - EOR reaches checkpoint_tables_callback for user trees (descr=yes
+    loaded=1)
+  - Root of (5, 16476) loads after restart with itemsCount=7 level=1
+    chkpNum=3 — tree structure is present at root level
+
+  **Still failing**: `SELECT count FROM crash_verify` returns 0
+  post-crash despite apparently-valid tree root. Leaves return empty
+  content even though pre-crash FPIs should be on PageServer.
+
+  **Remaining plausible causes (R24/R25/and)**:
+  - R24 PageServer ingest lag vs basebackup LSN — my N2 per-mutation
+    FPIs may be in WAL but not yet applied to PageServer layer files
+    at basebackup LSN.
+  - R25 WAL record encoding — bytes-identical round-trip UT passes
+    for the bare flag combo, but the LEAF_INSERT record also carries
+    BufData (delta payload); the combination might trip an edge
+    case in wal_decoder or smgrread.
+  - Non-checkpointed post-chkp=3 structural changes may still have
+    a gap my R22 doesn't cover (cascade propagation order, rightlink
+    chains, hikeys, etc.).
+
+  **Out-of-band next steps** (need this session's data):
+  1. Inspect PageServer layer files directly after a crash-test run
+     to see if expected (rel, blkno) Images exist and are byte-correct.
+  2. Extend wal_decoder round-trip UT to cover LEAF_INSERT with
+     both FPI+BufData together.
+  3. Instrument orioledb_redo to actually log whether replay runs
+     (visible in postmaster log file, not just compute.log tail-300).
+  4. Try a pre-RECEIVER variant: ship a commit-time "push pages to
+     PageServer synchronously" path that doesn't rely on async ingest.
+
+  **Plan items independent of 6.6.4c-3 still to deliver**:
+  - M1.1 dead-WAL-types cleanup (task #26)
+  - N3 sys-tree commit-barrier audit (post-N2)
+  - N6 structural WAL cleanup
+  - N8 crash-window test matrix (task #27)
+  - N10 benchmark gates
+
+- **2026-04-19 r6** (superseded by r7): R22 fix shipped (commit
+  6249cef: FPI on non-leaf downlink insert). Still count=0 post-crash.
+  R23-corrected diag (commit a5eeec4) showed user table (5, 16476)
+  root loads with `itemsCount=7 chunksCount=7 level=1 chkpNum=3` —
+  root has real structure pointing to 7 leaf children. So the tree
+  is not empty at root level; leaves return empty.
 
   **Hypothesis after r6**: PageServer doesn't have content for the
   post-chkp=3 leaf blocks at the LSN basebackup is taken. Either:
