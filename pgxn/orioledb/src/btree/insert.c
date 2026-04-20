@@ -1188,6 +1188,13 @@ o_btree_insert_item_no_waiters(BTreeInsertStackItem *insert_item,
 			 * `o_btree_finish_root_split_internal` via
 			 * `orioledb_page_wal_split`.
 			 */
+			{
+				static int fire_count = 0;
+				if (fire_count++ < 8)
+					elog(LOG, "R22 fire #%d: (%u,%u) blkno=%u level=%u",
+						 fire_count, desc->oids.datoid, desc->oids.relnode,
+						 blkno, PAGE_GET_LEVEL(p));
+			}
 			orioledb_page_wal_emit_fpi(desc, blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
 		}
 
