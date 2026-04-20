@@ -447,10 +447,16 @@ starts.
      PageServer synchronously" path that doesn't rely on async ingest.
 
   **Plan items independent of 6.6.4c-3 still to deliver**:
-  - M1.1 dead-WAL-types cleanup (task #26)
+  - M1.1 dead-WAL-types cleanup (task #26) — ✅ closed via commit 845d4cf:
+    audited, documented as reserved-but-not-emitted, all would-be
+    responsibilities covered by N2 commit-barrier path.
   - N3 sys-tree commit-barrier audit (post-N2)
   - N6 structural WAL cleanup
-  - N8 crash-window test matrix (task #27)
+  - N8 crash-window test matrix (task #27) — in progress: shipped
+    spec (N8_TEST_MATRIX.md) + N8.3 2PC script + N8.4 SAVEPOINT
+    script. Scripts not yet wired into CI — they'll flake the same
+    way as N8.1 until N2 root cause is closed; landing as harness
+    scaffolding ready to turn on once count=0 is fixed.
   - N10 benchmark gates
 
 - **2026-04-19 r6** (superseded by r7): R22 fix shipped (commit
