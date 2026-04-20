@@ -446,18 +446,38 @@ starts.
   4. Try a pre-RECEIVER variant: ship a commit-time "push pages to
      PageServer synchronously" path that doesn't rely on async ingest.
 
-  **Plan items independent of 6.6.4c-3 still to deliver**:
-  - M1.1 dead-WAL-types cleanup (task #26) — ✅ closed via commit 845d4cf:
-    audited, documented as reserved-but-not-emitted, all would-be
-    responsibilities covered by N2 commit-barrier path.
-  - N3 sys-tree commit-barrier audit (post-N2)
-  - N6 structural WAL cleanup
-  - N8 crash-window test matrix (task #27) — in progress: shipped
-    spec (N8_TEST_MATRIX.md) + N8.3 2PC script + N8.4 SAVEPOINT
-    script. Scripts not yet wired into CI — they'll flake the same
-    way as N8.1 until N2 root cause is closed; landing as harness
-    scaffolding ready to turn on once count=0 is fixed.
-  - N10 benchmark gates
+  **Plan items independent of 6.6.4c-3 still to deliver** (status at
+  2026-04-20 session close):
+  - M1.1 dead-WAL-types cleanup — ✅ closed (commit 845d4cf)
+  - N3 sys-tree commit-barrier audit — ✅ closed (commit 4814cab,
+    `docs/N3_SYS_TREE_AUDIT.md`). No new barriers needed; every
+    persistent sys-tree write is already on a CONTAINER-replay or
+    checkpoint-coupled path. Any residual DDL-crash concern inherits
+    from the 6.6.4c-3 CONTAINER-replay question, not a separate
+    barrier gap.
+  - N6 structural WAL cleanup — ✅ subsumed by M1.1 documentation
+    (commit 845d4cf): reserved types are clearly marked, nothing to
+    delete or re-activate.
+  - N8 crash-window test matrix — 🟡 4/7 scenarios shipped:
+    * N8.1 existing `test_e2e_crash_mid_ckpt.sh` (failing count=0)
+    * N8.2 `test_e2e_crash_compressed.sh` — compressed table
+    * N8.3 `test_e2e_crash_2pc.sh` — 2PC prepared-txn survival
+    * N8.4 `test_e2e_crash_savepoint.sh` — SAVEPOINT + ROLLBACK TO
+    * N8.7 `test_e2e_crash_concurrent.sh` — concurrent INSERT + SIGKILL
+    * N8.5 xidmap wraparound — needs injection-point infrastructure
+    * N8.6 failpoint-driven mid-checkpoint variants — needs failpoint hook
+    Not wired into CI yet (would flake on same N2 root cause as N8.1);
+    scaffolding ready to flip on atomically once N2 closes.
+  - N10 benchmark gates — ✅ spec shipped (commit 20d663b,
+    `docs/N10_BENCHMARK_GATES.md`). Six concrete budgets + harness
+    contract + escalation process. Harness implementation deferred
+    until N2 + N4 + N5 land (benchmarking a moving target wastes
+    effort). Budgets are in git so every later budget change is
+    auditable.
+  - N4 checkpoint thinning — pending on N2 closure
+  - N5 recovery minimal — pending on N2 closure
+  - N7 enterprise feature validation (branching/PITR/physrepl) —
+    pending on N5 closure
 
 - **2026-04-19 r6** (superseded by r7): R22 fix shipped (commit
   6249cef: FPI on non-leaf downlink insert). Still count=0 post-crash.
