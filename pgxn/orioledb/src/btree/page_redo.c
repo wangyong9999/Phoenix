@@ -77,6 +77,7 @@ orioledb_page_redo(XLogReaderState *record)
 		case ORIOLEDB_XLOG_MERGE:
 		case ORIOLEDB_XLOG_ROOT_SPLIT:
 		case ORIOLEDB_XLOG_UNDO_APPLY:
+		case ORIOLEDB_XLOG_PAGE_IMAGE:
 			/*
 			 * These are FPI-based records. In normal Neon operation, the
 			 * wal_decoder extracts the image and stores it as Value::Image,
