@@ -802,6 +802,20 @@ pub const AUX_FILES_KEY: Key = Key {
     field6: 2,
 };
 
+/// OrioleDB cold-start summary — singleton key. Holds the bincode /
+/// serde-serialized `wal_decoder::orioledb_state::OrioleDBColdStartSummary`
+/// maintained by walingest. Read at basebackup time (Phase 2.1 C.1/C.2)
+/// and consumed by compute at cold-start to seed OrioleDB shmem
+/// without WAL replay (Phase 2.1 C.3 / I4 Path A).
+pub const ORIOLEDB_STATE_KEY: Key = Key {
+    field1: 0x03,
+    field2: 0,
+    field3: 0,
+    field4: 0,
+    field5: 0,
+    field6: 3,
+};
+
 #[inline(always)]
 pub fn repl_origin_key(origin_id: RepOriginId) -> Key {
     Key {

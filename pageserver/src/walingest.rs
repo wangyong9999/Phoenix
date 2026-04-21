@@ -102,8 +102,14 @@ pub struct WalIngest {
     /// OrioleDB cold-start summary, derived from the rmid=129 stream
     /// as it is ingested. Phase 2.1 B.3 currently tracks
     /// `next_oxid` + bookkeeping only; B.4 expands coverage. Phase 2.1
-    /// C.1/C.2 will ship this to compute via basebackup.
+    /// C.1/C.2 ships this to compute via basebackup through
+    /// `ORIOLEDB_STATE_KEY`.
     pub(crate) oriole_summary: OrioleDBColdStartSummary,
+    /// Dirty flag — set when ingesting an rmid=129 record mutates
+    /// `oriole_summary`; cleared when the serialized summary is
+    /// persisted to `ORIOLEDB_STATE_KEY`. Mirrors the `checkpoint_modified`
+    /// pattern so the put happens only when the summary changed.
+    pub(crate) oriole_summary_modified: bool,
 }
 
 struct WarnIngestLag {
@@ -229,6 +235,7 @@ impl WalIngest {
                 timestamp_invalid_msg_ratelimit: RateLimit::new(std::time::Duration::from_secs(10)),
             },
             oriole_summary: OrioleDBColdStartSummary::default(),
+            oriole_summary_modified: false,
         })
     }
 
@@ -360,17 +367,23 @@ impl WalIngest {
                 // ORIOLEDB_WAL_KEY_PREFIX keys; page materialization happens
                 // in wal-redo on GetPage. Here we update the cold-start
                 // summary from the decoder-extracted delta (Phase 2.1 B.3).
-                if let Err(err) = self
+                match self
                     .oriole_summary
                     .ingest_delta(delta, interpreted.next_record_lsn.0)
                 {
-                    // Non-monotonic LSN or malformed payload is a caller
-                    // invariant violation; log and continue, do not halt
-                    // ingest on the summary side.
-                    tracing::warn!(
-                        "OrioleDB summary ingest skipped at LSN {}: {err:?}",
-                        interpreted.next_record_lsn
-                    );
+                    Ok(()) => {
+                        self.oriole_summary_modified = true;
+                    }
+                    Err(err) => {
+                        // Non-monotonic LSN or malformed payload is a
+                        // caller-invariant violation; log and continue —
+                        // summary stays at its previous state, do not
+                        // halt ingest on the summary side.
+                        tracing::warn!(
+                            "OrioleDB summary ingest skipped at LSN {}: {err:?}",
+                            interpreted.next_record_lsn
+                        );
+                    }
                 }
             }
             None => {
@@ -395,6 +408,17 @@ impl WalIngest {
 
             modification.put_checkpoint(new_checkpoint_bytes)?;
             self.checkpoint_modified = false;
+        }
+
+        // Similarly, persist the OrioleDB cold-start summary when the
+        // just-ingested record advanced any of its fields. The put
+        // lands at ORIOLEDB_STATE_KEY and is read by Phase 2.1 C.2
+        // basebackup emission to ship to compute at cold-start.
+        if self.oriole_summary_modified {
+            let bytes = bincode::serialize(&self.oriole_summary)
+                .expect("OrioleDBColdStartSummary bincode::serialize cannot fail");
+            modification.put_orioledb_state(Bytes::from(bytes))?;
+            self.oriole_summary_modified = false;
         }
 
         // Note that at this point this record is only cached in the modification

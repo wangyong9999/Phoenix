@@ -802,6 +802,27 @@ where
             .await
             .map_err(|e| BasebackupError::Client(e, "add_pgcontrol_file,pg_control"))?;
 
+        // Ship the OrioleDB cold-start summary when one is present.
+        // Tenants that do not use OrioleDB will see `None` here — emit
+        // nothing in that case. Compute-side consumption is Phase 2.1
+        // C.3; see libs/wal_decoder/src/orioledb_state.rs for the
+        // wire format (bincode of OrioleDBColdStartSummary).
+        if let Some(oriole_state_bytes) = self
+            .timeline
+            .get_orioledb_state(self.lsn, self.ctx)
+            .await
+            .context("failed to get orioledb state")?
+        {
+            let header = new_tar_header(
+                "global/orioledb.state",
+                oriole_state_bytes.len() as u64,
+            )?;
+            self.ar
+                .append(&header, &oriole_state_bytes[..])
+                .await
+                .map_err(|e| BasebackupError::Client(e, "add_pgcontrol_file,orioledb.state"))?;
+        }
+
         //send wal segment
         let segno = self.lsn.segment_number(WAL_SEGMENT_SIZE);
         let wal_file_name = XLogFileName(PG_TLI, segno, WAL_SEGMENT_SIZE);

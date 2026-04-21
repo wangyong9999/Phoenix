@@ -16,9 +16,9 @@ use anyhow::Context;
 use bytes::{Buf, Bytes, BytesMut};
 use enum_map::Enum;
 use pageserver_api::key::{
-    AUX_FILES_KEY, CHECKPOINT_KEY, CONTROLFILE_KEY, CompactKey, DBDIR_KEY, Key, RelDirExists,
-    TWOPHASEDIR_KEY, dbdir_key_range, rel_block_to_key, rel_dir_to_key, rel_key_range,
-    rel_size_to_key, rel_tag_sparse_key, rel_tag_sparse_key_range, relmap_file_key,
+    AUX_FILES_KEY, CHECKPOINT_KEY, CONTROLFILE_KEY, CompactKey, DBDIR_KEY, Key, ORIOLEDB_STATE_KEY,
+    RelDirExists, TWOPHASEDIR_KEY, dbdir_key_range, rel_block_to_key, rel_dir_to_key,
+    rel_key_range, rel_size_to_key, rel_tag_sparse_key, rel_tag_sparse_key_range, relmap_file_key,
     repl_origin_key, repl_origin_key_range, slru_block_to_key, slru_dir_to_key,
     slru_segment_key_range, slru_segment_size_to_key, twophase_file_key, twophase_key_range,
 };
@@ -1284,6 +1284,26 @@ impl Timeline {
         self.get(CHECKPOINT_KEY, lsn, ctx).await
     }
 
+    /// Fetch the OrioleDB cold-start summary blob at `lsn`.
+    ///
+    /// Returns `Ok(None)` when the key has never been written — i.e.
+    /// the timeline has seen no rmid=129 records and so has no
+    /// OrioleDB-specific state. `Ok(Some(bytes))` otherwise, where
+    /// the bytes decode to
+    /// `wal_decoder::orioledb_state::OrioleDBColdStartSummary`.
+    pub(crate) async fn get_orioledb_state(
+        &self,
+        lsn: Lsn,
+        ctx: &RequestContext,
+    ) -> Result<Option<Bytes>, PageReconstructError> {
+        use crate::tenant::PageReconstructError as PRE;
+        match self.get(ORIOLEDB_STATE_KEY, lsn, ctx).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(PRE::MissingKey(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn list_aux_files_v2(
         &self,
         lsn: Lsn,
@@ -1535,6 +1555,10 @@ impl Timeline {
 
         result.add_key(CONTROLFILE_KEY);
         result.add_key(CHECKPOINT_KEY);
+        // OrioleDB cold-start summary — only populated on timelines
+        // that see rmid=129 traffic; listing unconditionally is
+        // harmless (retention is per-key-existence).
+        result.add_key(ORIOLEDB_STATE_KEY);
 
         // Add extra keyspaces in the test cases. Some test cases write keys into the storage without
         // creating directory keys. These test cases will add such keyspaces into `extra_test_dense_keyspace`
@@ -2239,6 +2263,15 @@ impl DatadirModification<'_> {
 
     pub fn put_checkpoint(&mut self, img: Bytes) -> Result<(), WalIngestError> {
         self.put(CHECKPOINT_KEY, Value::Image(img));
+        Ok(())
+    }
+
+    /// Store the current serialized OrioleDB cold-start summary.
+    /// Called from walingest whenever an rmid=129 record mutates the
+    /// per-timeline summary; delivered back to compute at basebackup
+    /// time. See `libs/wal_decoder/src/orioledb_state.rs`.
+    pub fn put_orioledb_state(&mut self, img: Bytes) -> Result<(), WalIngestError> {
+        self.put(ORIOLEDB_STATE_KEY, Value::Image(img));
         Ok(())
     }
 
