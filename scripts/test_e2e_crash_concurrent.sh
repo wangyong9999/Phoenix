@@ -72,6 +72,13 @@ section "[1/10] Reset .neon + init + start + tenant + endpoint"
 cargo neon stop >/dev/null 2>&1 || true
 rm -rf .neon
 cargo neon init
+# WSL2 infra workaround: Windows host may squat on 127.0.0.1:7676 (e.g. Clash).
+# Only rewrite the safekeeper http port when the default is actually occupied.
+if (exec 3<>/dev/tcp/127.0.0.1/7676) 2>/dev/null; then
+    exec 3>&- 3<&-
+    echo "note: port 7676 busy on host — rewriting safekeeper http_port to 17676"
+    sed -i 's/http_port = 7676/http_port = 17676/' .neon/config
+fi
 cargo neon start
 sleep 3
 cargo neon tenant create --set-default
