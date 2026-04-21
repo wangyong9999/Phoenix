@@ -1585,6 +1585,33 @@ current_oxid_commit(CommitSeqNo csn)
 		o_buffers_sync(&buffersDesc, OXID_BUFFERS_TAG,
 					   offset, offset + sizeof(CommitSeqNo),
 					   WAIT_EVENT_SLRU_SYNC);
+
+		/*
+		 * Phase M1.4 (Neon Log-is-Data commit barrier — force-flush):
+		 * M1.2 (fsync_undo_range → Plan B PAGE_IMAGE for undo pages)
+		 * and M1.3 (o_buffers_write + o_buffers_sync → Plan B PAGE_IMAGE
+		 * for the xidmap block) emit XLogInsert records *inside*
+		 * XACT_EVENT_COMMIT — i.e. after RecordTransactionCommit has
+		 * already flushed the XACT_COMMIT record. Their LSNs are greater
+		 * than XACT_COMMIT's; PG's commit XLogFlush does NOT cover them.
+		 *
+		 * Without this flush, a crash between commit return and the next
+		 * WAL-writer cycle produces: XACT_COMMIT durable at SafeKeeper
+		 * but M1.2/M1.3 records NOT at SafeKeeper. New compute cold-starts
+		 * with PG-layer xid committed, Oriole-layer xidmap still showing
+		 * COMMITTING / stale CSN → tuples invisible → the concrete
+		 * 6.6.4c-3 count=0 mechanism. See docs/P1_6_I5_WRITE_AUDIT.md.
+		 *
+		 * XactLastRecEnd is set to the end of the most recent XLogInsert
+		 * in this backend (M1.3's write_buffer_data here). Same flush
+		 * target RecordTransactionCommit uses.
+		 *
+		 * Cost: one extra SafeKeeper round-trip per commit under
+		 * synchronous_commit=remote_flush. Sub-millisecond typical.
+		 * Required for I5-write under Log-is-Data (INVARIANTS.md §5).
+		 */
+		if (!XLogRecPtrIsInvalid(XactLastRecEnd))
+			XLogFlush(XactLastRecEnd);
 	}
 
 	pg_write_barrier();
