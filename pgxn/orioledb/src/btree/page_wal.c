@@ -35,6 +35,41 @@
 #include "utils/hsearch.h"
 
 /*
+ * Build the on-disk image of an in-memory OrioleDB B-tree page into
+ * `ondisk_buf` (must be ORIOLEDB_BLCKSZ bytes). Mirrors the header
+ * conversion in btree/io.c `write_page_to_disk`: the in-memory
+ * header (OrioleDBPageHeader — state atomic, pageChangeCount,
+ * checkpointNum) is replaced by an OrioleDBOndiskPageHeader
+ * (checkpointNum, compress_page_size, compress_version,
+ * page_version, reserved). The page body from offset
+ * O_PAGE_HEADER_SIZE onward is copied verbatim.
+ *
+ * Without this conversion, FPIs emitted via XLogInsert carry the
+ * in-memory header bytes (state atomic at offset 0-7 looks to an
+ * on-disk reader like `page_version == 0`), which FATALs in
+ * check_orioledb_page_version when a subsequent stateless restart
+ * reads the page before any Plan E checkpoint has overwritten it
+ * with the proper on-disk header (R9 — see EXECUTION_PLAN.md and
+ * docs/Q1_EVENT_CLOSURE_AUDIT.md G4 page-birth events).
+ */
+static void
+build_ondisk_page_image(char *ondisk_buf, Page in_memory_page)
+{
+	BTreePageHeader *in_hdr = (BTreePageHeader *) in_memory_page;
+	OrioleDBOndiskPageHeader *disk_hdr;
+
+	memset(ondisk_buf, 0, O_PAGE_HEADER_SIZE);
+	disk_hdr = (OrioleDBOndiskPageHeader *) ondisk_buf;
+	disk_hdr->checkpointNum = in_hdr->o_header.checkpointNum;
+	disk_hdr->compress_page_size = 0;
+	disk_hdr->compress_version = 0;
+	disk_hdr->page_version = ORIOLEDB_PAGE_VERSION;
+	memcpy(&ondisk_buf[O_PAGE_HEADER_SIZE],
+		   (char *) in_memory_page + O_PAGE_HEADER_SIZE,
+		   ORIOLEDB_BLCKSZ - O_PAGE_HEADER_SIZE);
+}
+
+/*
  * Check if page-level WAL emission is enabled.
  *
  * Only enabled in Neon mode (smgr_hook present) and when WAL insertion
@@ -224,10 +259,16 @@ orioledb_page_wal_emit_fpi(BTreeDescr *desc, OInMemoryBlkno blkno,
 	page = O_GET_IN_MEMORY_PAGE(blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
 
-	XLogBeginInsert();
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno,
-					  page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogInsert(ORIOLEDB_RMGR_ID, info);
+	{
+		char		ondisk_buf[ORIOLEDB_BLCKSZ];
+
+		build_ondisk_page_image(ondisk_buf, page);
+		XLogBeginInsert();
+		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno,
+						  ondisk_buf,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogInsert(ORIOLEDB_RMGR_ID, info);
+	}
 }
 
 /*
@@ -276,23 +317,29 @@ orioledb_page_wal_leaf_insert(BTreeDescr *desc, OInMemoryBlkno blkno,
 	xlrec.item_index = item_index;
 	xlrec.tuple_size = sizeof(BTreeLeafTuphdr) + tuple_len;
 
-	XLogBeginInsert();
-	/*
-	 * N2 commit-barrier for data pages: emit FPI on every leaf
-	 * mutation so PageServer has the authoritative post-mutation page
-	 * state. Without this, LEAF_INSERT deltas are stored as WalRecords
-	 * on PageServer that PG's wal-redo cannot apply (rmid=129 is
-	 * OrioleDB's, not PG's), and post-crash backends read empty pages
-	 * for every mutation past the last checkpoint — the root cause of
-	 * 6.6.4c-3 count=0. REGBUF_FORCE_IMAGE makes the WAL record
-	 * self-sufficient; see docs/ENTERPRISE_HARDENING_PLAN.md §N2.
-	 */
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page,
-					  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafInsert);
-	XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
-	XLogRegisterBufData(0, tuple_data, tuple_len);
-	XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_LEAF_INSERT);
+	{
+		char		ondisk_buf[ORIOLEDB_BLCKSZ];
+
+		build_ondisk_page_image(ondisk_buf, page);
+		XLogBeginInsert();
+		/*
+		 * N2 commit-barrier for data pages: emit FPI on every leaf
+		 * mutation so PageServer has the authoritative post-mutation
+		 * page state. build_ondisk_page_image converts the in-memory
+		 * header (state atomic etc.) to the on-disk layout
+		 * (checkpointNum + page_version) that
+		 * check_orioledb_page_version expects — without that
+		 * conversion a stateless restart before the next Plan E
+		 * checkpoint reads page_version=0 and FATALs (R9).
+		 */
+		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno,
+						  ondisk_buf,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafInsert);
+		XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
+		XLogRegisterBufData(0, tuple_data, tuple_len);
+		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_LEAF_INSERT);
+	}
 }
 
 /*
@@ -327,14 +374,20 @@ orioledb_page_wal_leaf_delete(BTreeDescr *desc, OInMemoryBlkno blkno,
 	xlrec.csn = 0;			/* CSN is in page header, not tuple header */
 	xlrec.undo_loc = tuphdr->undoLocation;
 
-	XLogBeginInsert();
-	/* N2: FPI per mutation — see LEAF_INSERT for the rationale. */
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page,
-					  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafDelete);
-	/* Store the full tuphdr for precise state restoration in redo */
-	XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
-	XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_LEAF_DELETE);
+	{
+		char		ondisk_buf[ORIOLEDB_BLCKSZ];
+
+		build_ondisk_page_image(ondisk_buf, page);
+		XLogBeginInsert();
+		/* N2 + R9: FPI per mutation with on-disk header format. */
+		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno,
+						  ondisk_buf,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafDelete);
+		/* Full tuphdr for precise state restoration in redo */
+		XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
+		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_LEAF_DELETE);
+	}
 }
 
 /*
@@ -371,14 +424,20 @@ orioledb_page_wal_leaf_update(BTreeDescr *desc, OInMemoryBlkno blkno,
 	xlrec.new_tuple_size = sizeof(BTreeLeafTuphdr) + tuple_len;
 	xlrec.pad = 0;
 
-	XLogBeginInsert();
-	/* N2: FPI per mutation — see LEAF_INSERT for the rationale. */
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno, page,
-					  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafUpdate);
-	XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
-	XLogRegisterBufData(0, tuple_data, tuple_len);
-	XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_LEAF_UPDATE);
+	{
+		char		ondisk_buf[ORIOLEDB_BLCKSZ];
+
+		build_ondisk_page_image(ondisk_buf, page);
+		XLogBeginInsert();
+		/* N2 + R9: FPI per mutation with on-disk header format. */
+		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, disk_blkno,
+						  ondisk_buf,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogRegisterBufData(0, (char *) &xlrec, SizeOfOrioleDBLeafUpdate);
+		XLogRegisterBufData(0, (char *) tuphdr, sizeof(BTreeLeafTuphdr));
+		XLogRegisterBufData(0, tuple_data, tuple_len);
+		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_LEAF_UPDATE);
+	}
 }
 
 /*
@@ -465,12 +524,21 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	right_page = O_GET_IN_MEMORY_PAGE(right_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
 
-	XLogBeginInsert();
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, left_disk,
-					  left_page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogRegisterBlock(1, &rlocator, MAIN_FORKNUM, right_disk,
-					  right_page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_SPLIT);
+	{
+		char		left_ondisk[ORIOLEDB_BLCKSZ];
+		char		right_ondisk[ORIOLEDB_BLCKSZ];
+
+		build_ondisk_page_image(left_ondisk, left_page);
+		build_ondisk_page_image(right_ondisk, right_page);
+		XLogBeginInsert();
+		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, left_disk,
+						  left_ondisk,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogRegisterBlock(1, &rlocator, MAIN_FORKNUM, right_disk,
+						  right_ondisk,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_SPLIT);
+	}
 }
 
 /*
@@ -501,10 +569,19 @@ orioledb_page_wal_merge(BTreeDescr *desc,
 	parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
 
-	XLogBeginInsert();
-	XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, left_disk,
-					  left_page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogRegisterBlock(1, &rlocator, MAIN_FORKNUM, parent_disk,
-					  parent_page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
-	XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_MERGE);
+	{
+		char		left_ondisk[ORIOLEDB_BLCKSZ];
+		char		parent_ondisk[ORIOLEDB_BLCKSZ];
+
+		build_ondisk_page_image(left_ondisk, left_page);
+		build_ondisk_page_image(parent_ondisk, parent_page);
+		XLogBeginInsert();
+		XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, left_disk,
+						  left_ondisk,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogRegisterBlock(1, &rlocator, MAIN_FORKNUM, parent_disk,
+						  parent_ondisk,
+						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_MERGE);
+	}
 }

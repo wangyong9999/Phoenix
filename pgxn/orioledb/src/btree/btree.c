@@ -19,6 +19,8 @@
 #include "btree/insert.h"
 #include "btree/io.h"
 #include "btree/page_chunks.h"
+#include "btree/page_wal.h"		/* orioledb_page_wal_emit_fpi */
+#include "btree/page_walrecord.h"	/* ORIOLEDB_XLOG_PAGE_IMAGE */
 #include "btree/scan.h"
 #include "btree/undo.h"
 #include "catalog/o_tables.h"
@@ -62,6 +64,31 @@ o_btree_init(BTreeDescr *desc)
 	 * checkpoint would leave a .map file with an unwritten header.
 	 */
 	MARK_DIRTY(desc, desc->rootInfo.rootPageBlkno);
+
+	/*
+	 * Neon Log-is-Data (R9): emit a PAGE_IMAGE FPI for the freshly
+	 * initialized root so PageServer has a base image for this page
+	 * from the moment the tree exists. Without this, a crash before the
+	 * first Plan E checkpoint leaves PageServer with no base for the
+	 * root: subsequent LEAF_* / SPLIT / MERGE deltas apply to a
+	 * zero-filled page, and the next post-restart read FATALs in
+	 * `check_orioledb_page_version("Page version 0 of OrioleDB cluster
+	 * is not among supported for conversion 1")`. See
+	 * `docs/EXECUTION_PLAN.md` R9 and `docs/Q1_EVENT_CLOSURE_AUDIT.md`
+	 * G4 (page-birth events).
+	 *
+	 * Only for persistence trees in Neon mode — in-memory / temporary
+	 * trees are not on the PageServer materialization path.
+	 * `orioledb_page_wal_emit_fpi` internally checks
+	 * `orioledb_page_wal_enabled()` (smgr_hook != NULL &&
+	 * XLogInsertAllowed()), so recovery-time init is a safe no-op.
+	 */
+	if (desc->storageType == BTreeStoragePersistence)
+	{
+		orioledb_page_wal_emit_fpi(desc,
+								   desc->rootInfo.rootPageBlkno,
+								   ORIOLEDB_XLOG_PAGE_IMAGE);
+	}
 }
 
 static bool
