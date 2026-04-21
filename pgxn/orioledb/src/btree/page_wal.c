@@ -520,9 +520,28 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	if (left_disk == InvalidBlockNumber || right_disk == InvalidBlockNumber)
 		return;
 
+	/*
+	 * SPLIT FPIs carry two block refs at {0, 1}. XLogRegisterBlock asserts
+	 * these must target distinct (rlocator, fork, block). If left and right
+	 * somehow share a disk blkno (e.g. first-ever sys-tree split where the
+	 * new page's extent slot collides with the existing page), splitting the
+	 * WAL into two single-block records keeps PageServer's reconstruction
+	 * path correct and sidesteps the assert. The cost is one extra record.
+	 */
 	left_page = O_GET_IN_MEMORY_PAGE(left_blkno);
 	right_page = O_GET_IN_MEMORY_PAGE(right_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
+
+	if (left_disk == right_disk)
+	{
+		elog(WARNING,
+			 "OrioleDB SPLIT: left_disk == right_disk == %u for rel (%u,%u); "
+			 "emitting as two single-block PAGE_IMAGE records",
+			 left_disk, rlocator.dbOid, rlocator.relNumber);
+		orioledb_page_wal_emit_fpi(desc, left_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
+		orioledb_page_wal_emit_fpi(desc, right_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
+		return;
+	}
 
 	{
 		char		left_ondisk[ORIOLEDB_BLCKSZ];
@@ -568,6 +587,17 @@ orioledb_page_wal_merge(BTreeDescr *desc,
 	left_page = O_GET_IN_MEMORY_PAGE(left_blkno);
 	parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
+
+	if (left_disk == parent_disk)
+	{
+		elog(WARNING,
+			 "OrioleDB MERGE: left_disk == parent_disk == %u for rel (%u,%u); "
+			 "emitting as two single-block PAGE_IMAGE records",
+			 left_disk, rlocator.dbOid, rlocator.relNumber);
+		orioledb_page_wal_emit_fpi(desc, left_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
+		orioledb_page_wal_emit_fpi(desc, parent_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
+		return;
+	}
 
 	{
 		char		left_ondisk[ORIOLEDB_BLCKSZ];
