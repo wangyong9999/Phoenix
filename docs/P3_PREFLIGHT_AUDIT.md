@@ -153,3 +153,76 @@ SPLIT / MERGE / PAGE_IMAGE 也是 page-level，block-keyed（已验证 R9/R11）
    - 最坏结果：某 assert PANIC → 记录 stack trace，回阶段 0 再审一轮
 
 保持 spike 在 worktree 内，**不合并到 main**。
+
+---
+
+## 阶段 1 spike 结果（2026-04-21 执行）
+
+**Patch（已回滚）：** `compute_tools/src/compute.rs:1772` 把 `if sync_lsn_present { ... }` 加 `ORIOLEDB_SPIKE_SKIP_SIGNAL` 环境变量开关。绕过 WAL copy + signal 写入 + `skip_unmodified_trees=false` GUC 推送三件事。
+
+### 正面信号（Phase 3 核心机制证明通）
+
+在 CRUD 测试的 restart 路径里，**lazy-load cold-start 机制成功运转**：
+
+```
+[744907] OrioleDB: control file loaded from PageServer (chkp=1)
+[744907] OrioleDB: deferred control file load from PageServer, chkp_num=1, reset 24 sys trees
+[744907] evictable_tree_init_meta: (1, 2) root loaded ... chkpNum=1 itemsCount=2 ...   # O_TABLES
+[744907] evictable_tree_init_meta: (1, 3) root loaded ... chkpNum=1 itemsCount=4 ...   # O_INDICES
+[744907] evictable_tree_init_meta: (1, 4) root loaded ... chkpNum=1 itemsCount=3 ...   # OPCLASS_CACHE
+[744907] evictable_tree_init_meta: (5, 16476) root loaded ... chkpNum=1 itemsCount=35 level=1  # 用户树
+```
+
+所有 sys-tree 和用户表的 root 都从 PageServer 正确加载。`recovery_requested=0` 全程。`apply_orioledb_cold_start_summary` 自动 bump xid/csn state（B.3/B.4 管道按预期工作）。这**证实**了 Phase 3 的 lazy-load + summary apply 主路径是可行的。
+
+### 发现的 P3 硬缺口（G1）
+
+**G1 — SIGKILL-before-first-checkpoint 场景**：`test_e2e_crash_concurrent.sh` 第二 session 撞进：
+
+```
+[747336] checkpointable_tree_init: (1, 2) chkp_num=0 concurrent=0
+[747336] evictable_tree_init_meta: (1,2) INIT fork smgrexists=1
+[747336] evictable_tree_init_meta: nblocks=0 have_map=0
+...
+[747336] TRAP: failed Assert("o_table"), File: "src/tableam/scan.c", Line: 217
+```
+
+**根因链**：
+1. 第一 session 起 PG → SIGKILL → 整个过程中**从未跑过 checkpoint**（并发 INSERT 在 CREATE TABLE 刚结束时就被 kill）。
+2. PageServer 收到了所有 page-level LEAF_INSERT / PAGE_IMAGE WAL（mutation 路径每次发射），但**从未收到 checkpoint_map_write_header 发射的 map file FPI**，也**从未收到 `write_checkpoint_control` 发射的控制文件 FPI**。
+3. 第二 session cold-start：basebackup 在 post-crash LSN 0/1EF52A8 展开 → `get_checkpoint_control_data` 失败（PageServer 里没有 control file FPI）→ `sys_trees_load_control_if_deferred` 不执行 → `lastCheckpointNumber` 保持 0 → 树 init 用 chkp_num=0 → map file 读到 nblocks=0 → shmem 树为空 → o_tables_get 返回 NULL → SELECT planner assert 炸。
+
+**这是真正的 Phase 3 blocker，不是 summary 字段缺口。**
+
+### G1 形状：三种可能 fix
+
+| 方案 | 思路 | 代价 | 长期架构评价 |
+|---|---|---|---|
+| G1-a | 把 map file + control file 内容纳入 summary v3，走 B.3 管道 | summary 膨胀（每 tree 一个 rootDownlink+chkpNum，~16 字节/tree）| ✅ 最对齐 Log-is-Data：summary 成为 compute 的单一依赖 |
+| G1-b | 让 mutation 时顺便把更新后的 rootDownlink 塞 WAL（每次 tree 根 COW 时发一条微型 FPI）| emit 频率大涨 | ❌ WAL 量爆炸 |
+| G1-c | compute 启动时强制 basebackup 包含一个"合成 control file"，由 walingest 根据 page-level WAL 自己反推 tree 根 | PageServer 端需要半解析 rmid=129 | 中性：复杂度转移到 PageServer |
+
+**推荐 G1-a**：walingest 已经在消化 rmid=129 流（B.3/B.4）。扩展它同时记录每个 tree 的最新 rootDownlink + 当前 chkpNum 是最自然的延伸。basebackup 时把这个"逻辑 control file"一起投递，替代从 PageServer Plan E 镜像拉 control file。
+
+### G2（次级，可与 G1 并行修）
+
+**G2 — CRUD restart 后 user table `SELECT count(*)=0` 但 sys-tree 完整**：
+第二 session 加载了用户表 root (chkpNum=1 itemsCount=35 level=1)，但 PageServer log 零次命中用户表 blkno 的 GetPage。需要加 elog 到 `btree_smgr_read` / `read_page_from_disk` 路径精细定位，当前未解。可能 2 slot 数据文件 + PageServer 单 blkno-per-rel 语义之间有错位——独立于 G1 的侧边 bug。
+
+### 对 Phase 3 计划的调整
+
+| 阶段 | 原预期 | spike 后调整 |
+|---|---|---|
+| 阶段 1 | 探路 | ✅ 完成；主路径机制 OK，暴露 G1 + G2 |
+| 阶段 2 | B.5 undo/xidmap positions | **提升：变成 B.5 summary schema 重做——把 tree roots (map file 等效) + control file 要点一并纳入** |
+| 阶段 3 | 切默认 | 不变，需先关阶段 2 |
+| 阶段 4 | 清理 | 不变 |
+
+**阶段 2 具体工作（初步）**：
+
+1. 设计 summary v3 wire 格式：固定部分（xid/csn 同 v2）+ 每 sys-tree / user-tree 一个 `TreeRootEntry { datoid, relnode, chkpNum, rootDownlink }`。user-tree 数可变。
+2. walingest 侧：观察 rmid=129 里的 SMGR_CREATE + PAGE_IMAGE blocks，维护当前每 tree 的最新 rootDownlink。
+3. basebackup 投递 summary v3（复用 ORIOLEDB_STATE_KEY keyspace 条目，或新增 per-tree entry）。
+4. compute 侧 `apply_orioledb_cold_start_summary`：除了现有 xid bump，还要依据 summary 重建"假 control file"，或直接把 tree roots 灌进 `checkpoint_state`。
+
+**G2 诊断先行**：不卡住阶段 2。可以并行起一个 debug elog branch 排查。
