@@ -31,6 +31,7 @@
 #include "btree/page_wal.h"
 #include "btree/page_walrecord.h"
 #include "catalog/storage_xlog.h"
+#include "checkpoint/checkpoint.h"	/* CheckpointFileHeader */
 #include "storage/ipc.h"
 #include "utils/hsearch.h"
 
@@ -222,6 +223,66 @@ orioledb_page_wal_rlocator(BTreeDescr *desc, RelFileLocator *rlocator)
 	rlocator->spcOid = DEFAULTTABLESPACE_OID;
 	rlocator->dbOid = desc->oids.datoid;
 	rlocator->relNumber = desc->oids.relnode;
+}
+
+/*
+ * Emit the initial INIT fork block 0 ("map header") to PageServer so
+ * that a subsequent stateless cold-start can locate this tree's root
+ * without having to wait for the first periodic checkpoint.
+ *
+ * Called from o_btree_init after the root's MAIN-fork FPI has been
+ * emitted — at that point desc->rootInfo's in-memory page descriptor
+ * has a valid fileExtent.off (assigned by orioledb_page_ensure_extent
+ * inside the preceding orioledb_page_wal_emit_fpi call).
+ *
+ * Rationale (B.5 / docs/B5_SUMMARY_V3_SCHEMA.md):
+ *   Before this helper existed, INIT fork block 0 was only emitted by
+ *   checkpoint_map_write_header during a non-shutdown checkpoint.
+ *   If a workload crashed before any checkpoint fired (e.g. the
+ *   test_e2e_crash_concurrent.sh SIGKILL-mid-INSERT scenario), the
+ *   post-restart basebackup contained no INIT fork for any tree;
+ *   evictable_tree_init_meta's Plan E fallback saw smgrnblocks=0 and
+ *   returned an empty-root shmem, causing SELECT planner to assert
+ *   Assert("o_table"). Emitting the header at tree creation closes
+ *   that gap for every Persistence tree — both sys-trees (populated
+ *   on first backend touch) and user tables (populated at CREATE TABLE).
+ *
+ * The root's physical block never moves during normal IUD (root split
+ * preserves fileExtent.off in insert.c:o_btree_finish_root_split_internal),
+ * so no mid-workload re-emission is needed. Checkpoints still rewrite
+ * this block via checkpoint_map_write_header with the full header
+ * including free-extent list; this function writes only the minimal
+ * header fields required for cold-start root discovery.
+ */
+void
+orioledb_page_wal_emit_map_header(BTreeDescr *desc)
+{
+	OrioleDBPageDesc *root_desc;
+	RelFileLocator rlocator;
+	CheckpointFileHeader header = {0};
+	char		page[BLCKSZ];
+
+	if (!orioledb_page_wal_enabled())
+		return;
+
+	root_desc = O_GET_IN_MEMORY_PAGEDESC(desc->rootInfo.rootPageBlkno);
+	if (!FileExtentIsValid(root_desc->fileExtent))
+		return;
+
+	header.rootDownlink = MAKE_ON_DISK_DOWNLINK(root_desc->fileExtent);
+	header.datafileLength = 1;
+	header.leafPagesNum = 1;
+	/* ctid, bridgeCtid, numFreeBlocks intentionally zero */
+
+	memset(page, 0, BLCKSZ);
+	memcpy(page, &header, sizeof(header));
+
+	orioledb_page_wal_rlocator(desc, &rlocator);
+
+	XLogBeginInsert();
+	XLogRegisterBlock(0, &rlocator, INIT_FORKNUM, 0,
+					  page, REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+	XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_PAGE_IMAGE);
 }
 
 /*

@@ -37,6 +37,9 @@ extern void orioledb_page_wal_rlocator(BTreeDescr *desc,
 extern void orioledb_page_wal_emit_fpi(BTreeDescr *desc,
 									   OInMemoryBlkno blkno, uint8 info);
 
+/* Emit initial INIT-fork block 0 (map header) at tree creation (B.5) */
+extern void orioledb_page_wal_emit_map_header(BTreeDescr *desc);
+
 /* Emit LEAF_INSERT delta WAL */
 extern void orioledb_page_wal_leaf_insert(BTreeDescr *desc,
 										  OInMemoryBlkno blkno,

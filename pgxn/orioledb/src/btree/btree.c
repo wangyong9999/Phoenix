@@ -88,6 +88,16 @@ o_btree_init(BTreeDescr *desc)
 		orioledb_page_wal_emit_fpi(desc,
 								   desc->rootInfo.rootPageBlkno,
 								   ORIOLEDB_XLOG_PAGE_IMAGE);
+
+		/*
+		 * B.5 — emit INIT fork block 0 (map header) right after the root
+		 * FPI, so a stateless cold-start can find this tree's root via
+		 * evictable_tree_init_meta's Plan E fallback even before the
+		 * first periodic checkpoint runs. Closes the R10/crash_concurrent
+		 * SIGKILL-before-any-checkpoint gap. Root's fileExtent.off was
+		 * just assigned by the FPI emit above; helper reads it there.
+		 */
+		orioledb_page_wal_emit_map_header(desc);
 	}
 }
 
