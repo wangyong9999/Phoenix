@@ -25,6 +25,12 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PATH="$PROJECT_DIR/pg_install/v17/bin:$PATH"
 
+# WSL2 dev env: neon_local's HTTP health probe of compute_ctl on
+# 127.0.0.1 can get hijacked by a shell-level HTTP proxy (e.g. Clash)
+# even though no_proxy mentions 127.*. Drop proxy vars so all localhost
+# HTTP traffic in this test goes direct. No effect in CI.
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
 ROWS="${ROWS:-5000}"
 ENDPOINT_NAME="${ENDPOINT_NAME:-main}"
 PSQL_DB="${PSQL_DB:-postgres}"
