@@ -5186,7 +5186,26 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 		checkpoint_ix_init_state(checkpoint_state, td);
 		checkpoint_init_new_seq_bufs(td, chkpNum);
 
-		if (!meta->dirtyFlag1 && !meta->dirtyFlag2)
+		/*
+		 * R13: during signal-path end-of-recovery, PG's XLog machinery
+		 * applies rmid=129 FPIs into PG's buffer cache but does NOT touch
+		 * OrioleDB's in-memory meta->dirtyFlag{1,2}. That makes the
+		 * dirtyFlag-based skip below fire for user tables that actually
+		 * changed during replay, leaving the chkpNum=N+1 slot empty even
+		 * though the chkpNum=N slot has the real state. Backends that
+		 * later open the tree at chkpNum=N+1 then read garbage/empty.
+		 *
+		 * Under Neon + end-of-recovery (orioledb_recovery.signal), force
+		 * every persistence tree through checkpoint_ix so both chkpNum
+		 * slots stay in sync. The cost is one map_file FPI per user
+		 * tree per stateless restart, bounded by SYS_TREES_NUM +
+		 * |user tables|. This is the same direction as
+		 * skip_unmodified_trees=false (compute_tools sets that GUC on
+		 * the signal path for exactly this reason) but closes the gap
+		 * the dirtyFlag-based inner skip leaves open.
+		 */
+		if ((!meta->dirtyFlag1 && !meta->dirtyFlag2)
+			&& !(smgr_hook != NULL && (tbl_arg->flags & CHECKPOINT_END_OF_RECOVERY)))
 		{
 			chkp_inc_changecount_before(checkpoint_state);
 			if (!meta->dirtyFlag1 && !meta->dirtyFlag2)
