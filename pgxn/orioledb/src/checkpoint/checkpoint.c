@@ -1234,6 +1234,14 @@ o_perform_checkpoint(XLogRecPtr redo_pos, int flags)
 	orioledb_check_shmem();
 
 	/*
+	 * R10 end-of-recovery hang is still open. An earlier attempt to
+	 * skip this checkpoint under Neon mode caused data loss because
+	 * the interim signal-path architecture relies on its Plan E FPIs
+	 * for the next cold start. Root-cause debugging of the sys-tree
+	 * (1,8) CLASS_CACHE hang is tracked in docs/EXECUTION_PLAN.md R10.
+	 */
+
+	/*
 	 * Track shutdown state for FPI emission guards.
 	 * FPI emission (in write_checkpoint_control, page_wal, etc.) must
 	 * NOT happen during shutdown checkpoint — PG blocks WAL insertion
