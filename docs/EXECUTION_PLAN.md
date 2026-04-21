@@ -1,6 +1,6 @@
 # OrioleDB-on-Neon — Execution Plan
 
-> **Status:** v1.1 — 2026-04-21.
+> **Status:** v1.2 — 2026-04-21.
 >
 > **Purpose:** 把 "设计问题 Q1–Q5" 与 "实施接口 E1–E4" 之间的协同关系、
 > 门禁、风险点写清楚，作为后续每个 PR 的上位 checklist。
@@ -261,25 +261,28 @@ Phase 3 的主体 retirement（P3.1–P3.3）已归并进 Phase 2.1 末尾。本
 | R5 | wait_lsn 60s ceiling **不够 sys-tree 首访** | Phase 2.2 F.2 | 未触发 | 调 `wait_lsn_timeout`；或在 E3 冷启动阶段预加载 sys-tree meta 页 |
 | R6 | Q5 发现某 shmem 标量**既非 sys-tree 可得也非 summary 可重建** | Phase 1a P1.5 | **Closed 2026-04-21** | Q5 v0.1 Categories A+B 全部 summary-可重建；R.1–R.4 residuals 不在关键路径 |
 | R7 | Phase 2.1 signal retirement 后 logical decoding 回归 | P3.2 | 未触发 | P3.2 降级不删：`apply_btree_modify_record` 仍编译进 binary，但新 codepath 不调用；R14 独立 consumer 保留 |
-| **R8** (new) | A.6 XLogFlush 未充分验证（E2E 环境不完整） | A.6 本次 commit | Open | Phase 2.1 启动前在完整环境（含 storage controller）回归跑 `test_e2e_crash_concurrent.sh` 等 crash 矩阵，empirical 确认 |
+| ~~R8~~ | ~~A.6 XLogFlush 未充分验证~~ | A.6 本次 commit | **Partially closed 2026-04-21** | 已完成：PG 17.8 + Rust 二进制重建就位（build env 修复，fix commit 80e8829 包含 WSL2 port 7676 冲突的条件性 patch）；`test_e2e_crud.sh` PASS 确认 A.6 不破 clean-shutdown 路径。未完成：`test_e2e_crash_concurrent.sh` 阻塞于独立层 bug（见 R9），非 A.6 问题。Phase 2.1 B.3 启动不再受 R8 阻塞。 |
+| **R9** (new) | `test_e2e_crash_concurrent.sh` 在 [5/10] 段 PG 报 `FATAL: Page version 0 of OrioleDB cluster is not among supported for conversion 1` | SIGKILL 后 stateless restart 走 signal 路径 + selective replay | Open | 这是 commit 284618a 的 6.6.4c-2 类 bug 类（应由 397af78 pageserver `put_rel_creation` 修复，但触发点可能不同）。属于 PageServer rel_size / synthetic relation creation 层，不是 A.6 的 xidmap/undo flush 问题。自然会在 Phase 2.1 C.1/C.2（basebackup 改造）触及；若 B.3/B.4 过程中发现更清晰定位可提前修 |
 
 ---
 
-## 7 — 当前推进态（快照，v1.1 截面）
+## 7 — 当前推进态（快照，v1.2 截面）
 
 ```
 Phase 1a ✅ (P1.1 / P1.5 / P1.6 全闭合)
 Phase 1b ⏳ (Q2/Q3/Q4 pending，但不阻塞)
 Phase 1c ⏳ (P1.7，小工作)
 
-Phase 2.1 ⏸ (A.6 ✅ commit 1434272，B.3 尚未启动)
+Phase 2.1 ⏳ (A.6 ✅ commit 1434272 + 部分 empirical 验证 ✅ commit 80e8829;
+             test_e2e_crud PASS 确认无回归；crash_concurrent 被 R9 阻塞；
+             B.3 walingest OrioleDB summary structure 为下一步)
 Phase 2.2 ⏸ (可随 Phase 2.1 并行启动)
 Phase 2.3 ⏸ (等 Phase 2.1 稳定)
 
 Phase 3 归并 Phase 2.1 末段
 ```
 
-**下一步候选**：B.3 walingest OrioleDB-state summary 结构设计与落地。其余 Phase 2.1 任务依次推进。
+**下一步**：Phase 2.1 B.3 —— walingest OrioleDB-state summary 结构设计与落地（Rust，`pageserver/src/walingest.rs` 扩展）。输入：`docs/Q5_COLDSTART_SOURCES.md §2` summary schema + §3 update rules table。
 
 ---
 
@@ -287,3 +290,4 @@ Phase 3 归并 Phase 2.1 末段
 
 - **v1.0 (2026-04-21)** — 初稿。Q（设计问题）× E（实施接口）两维度。Phase 1–3 门禁 + DoD + 风险登记。
 - **v1.1 (2026-04-21)** — Phase 1 拆成 1a/1b/1c，只要 1a 是 Phase 2.1 硬前置。Phase 2 重构为 2.1（I4 关键路径串行）/ 2.2（并行硬化）/ 2.3（语义粒度）。原 Phase 2.5 Track C 并入 Phase 2.1。A.6 从条件性升为硬前置并标记 ✅ commit 1434272。R4 + R6 关闭，新增 R8（A.6 empirical 验证待完整环境回归）。加 §7 "当前推进态"快照。
+- **v1.2 (2026-04-21)** — R8 部分关闭：build env 修复（commit 80e8829 含 WSL2 port 7676 冲突 fix）+ `test_e2e_crud.sh` PASS 证实 A.6 不破 clean-shutdown。新增 R9：`test_e2e_crash_concurrent.sh` 在 [5/10] 段 `FATAL: Page version 0` 是 6.6.4c-2 类 PageServer rel_size bug，跟 A.6 正交。§7 快照反映 Phase 2.1 A.6 步完成 + 下一步指向 B.3。
