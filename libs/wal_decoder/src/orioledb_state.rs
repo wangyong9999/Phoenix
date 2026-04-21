@@ -85,15 +85,26 @@ pub mod wal_rec_type {
     pub const RELREPLIDENT: u8 = 18;
 }
 
+/// Sub-record sizes — see `pgxn/orioledb/include/recovery/wal.h`.
+///
+/// `WALRecXid`        : 1 recType + 8 oxid + 4 logicalXid + 4 heapXid = 17
+/// `WALRecFinish`     : 1 recType + 8 xmin + 8 csn = 17 (used for COMMIT / ROLLBACK)
+/// `WALRecJointCommit`: 1 recType + 4 xid + 8 xmin + 8 csn = 21
+const WAL_REC_XID_LEN: usize = 17;
+const WAL_REC_FINISH_LEN: usize = 17;
+const WAL_REC_JOINT_COMMIT_LEN: usize = 21;
+
 /// Offset of the `oxid` field inside `WALRecXid` — immediately after
-/// `recType` (1 byte). Width is `sizeof(OXid) = 8`. See
-/// `pgxn/orioledb/include/recovery/wal.h:120-127`.
+/// `recType` (1 byte).
 const WAL_REC_XID_OXID_OFFSET: usize = 1;
 
-/// Minimum length we need to read a `WALRecXid` up to and including
-/// the `oxid` field. The full record is larger (includes logicalXid
-/// and heapXid) but we do not decode those fields in v0.2.
-const WAL_REC_XID_MIN_LEN_FOR_OXID: usize = WAL_REC_XID_OXID_OFFSET + 8;
+/// Offset of the `csn` field inside `WALRecFinish` — after recType (1)
+/// + xmin (8) = 9.
+const WAL_REC_FINISH_CSN_OFFSET: usize = 9;
+
+/// Offset of the `csn` field inside `WALRecJointCommit` — after
+/// recType (1) + xid (4) + xmin (8) = 13.
+const WAL_REC_JOINT_COMMIT_CSN_OFFSET: usize = 13;
 
 // --- Types ------------------------------------------------------------------
 
@@ -127,9 +138,13 @@ pub enum ContainerParseError {
 pub struct OrioleDbRecordDelta {
     /// PG TransactionId from the CONTAINER `xact_info` header.
     pub pg_xid: Option<u32>,
-    /// OrioleDB OXid from the first `WAL_REC_XID` sub-record in the
-    /// body (v0.2 decodes only the first sub-record).
-    pub oxid_in_body: Option<u64>,
+    /// Largest OrioleDB OXid seen in a `WAL_REC_XID` sub-record while
+    /// scanning the container body.
+    pub max_oxid_in_body: Option<u64>,
+    /// Largest `CommitSeqNo` seen in a `WAL_REC_COMMIT` or
+    /// `WAL_REC_JOINT_COMMIT` sub-record. `WAL_REC_ROLLBACK` does not
+    /// bump next_csn (its CSN is `COMMITSEQNO_ABORTED`).
+    pub max_csn_in_body: Option<u64>,
 }
 
 /// Per-timeline OrioleDB cold-start summary.
@@ -157,6 +172,15 @@ pub struct OrioleDBColdStartSummary {
     /// cold-start to seed `xid_meta->nextXid`; see Q5 §2 and
     /// `pgxn/orioledb/src/transam/oxid.c:1262`.
     pub next_oxid: u64,
+
+    /// Next `CommitSeqNo` to allocate — one past the maximum CSN
+    /// observed in any `WAL_REC_COMMIT` / `WAL_REC_JOINT_COMMIT`
+    /// sub-record. `0` until the first commit record is seen.
+    /// Compute reads this to bump `startupCommitSeqNo` before PG's
+    /// StartupXLOG writes it into `TransamVariables->nextCommitSeqNo`
+    /// (see `vendor/postgres-v17/src/backend/access/transam/xlog.c:5669`).
+    /// Added in packed format version 2.
+    pub next_csn: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,12 +199,16 @@ pub enum IngestError {
 pub const ORIOLEDB_STATE_MAGIC: u32 = 0x534F524F;
 
 /// Wire-format version. Bump when fields or layout change; the C-side
-/// reader (`pgxn/orioledb/src/...`) must be updated accordingly.
-pub const ORIOLEDB_STATE_VERSION: u32 = 1;
+/// reader must be updated accordingly.
+///
+/// History:
+/// - v1 (40 bytes): next_oxid, last_pg_xid_seen, last_ingested_lsn_raw,
+///   ingested_count. (Superseded — never shipped to production.)
+/// - v2 (48 bytes): v1 + next_csn. Current.
+pub const ORIOLEDB_STATE_VERSION: u32 = 2;
 
-/// Fixed wire-format size for `ORIOLEDB_STATE_VERSION == 1`.
-/// See `encode_packed` for the byte layout.
-pub const ORIOLEDB_STATE_ENCODED_SIZE: usize = 40;
+/// Fixed wire-format size for the current `ORIOLEDB_STATE_VERSION`.
+pub const ORIOLEDB_STATE_ENCODED_SIZE: usize = 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
@@ -255,26 +283,97 @@ pub fn parse_container_header(
 
 // --- Body parser (v0.2: first sub-record only) ------------------------------
 
-/// Decode the body's first sub-record if it is `WAL_REC_XID`.
-/// Returns the OXid from the record, else `None`.
+/// Linearly scan a CONTAINER body, decoding the sub-record types we
+/// care about (XID, COMMIT, ROLLBACK, JOINT_COMMIT). Unknown types
+/// abort the scan — we stop at the first byte we cannot interpret
+/// rather than guess at record lengths.
 ///
-/// v0.2 only decodes the first sub-record. A CONTAINER body typically
-/// starts with `WAL_REC_XID` when the emitting backend writes the
-/// OXid binding via `add_xid_wal_record`
-/// (`pgxn/orioledb/src/recovery/wal.c`). Containers that start with a
-/// different record type return `None` here — v0.3/B.4 adds full
-/// sub-record traversal.
-fn first_oxid_from_body(body: &[u8]) -> Option<u64> {
-    if body.len() < WAL_REC_XID_MIN_LEN_FOR_OXID {
-        return None;
+/// Returns `(max_oxid, max_csn)` where either may be `None`.
+///
+/// COMMIT and JOINT_COMMIT bump `max_csn`; ROLLBACK only advances the
+/// cursor (its `csn` field is `COMMITSEQNO_ABORTED` and must not bump
+/// next_csn). XID bumps `max_oxid`.
+///
+/// Full sub-record inventory lives at
+/// `pgxn/orioledb/include/recovery/wal.h`; B.4 handles the common
+/// commit-path subset. Non-commit sub-records (INSERT / UPDATE /
+/// DELETE / REINSERT / RELATION / …) terminate the scan — B.5/later
+/// can extend to those if per-tree counter tracking is needed.
+fn scan_container_body(body: &[u8]) -> (Option<u64>, Option<u64>) {
+    let mut cursor = 0usize;
+    let mut max_oxid: Option<u64> = None;
+    let mut max_csn: Option<u64> = None;
+
+    while cursor < body.len() {
+        let rec_type = body[cursor];
+        let consumed = match rec_type {
+            wal_rec_type::XID => {
+                if cursor + WAL_REC_XID_LEN > body.len() {
+                    break;
+                }
+                let oxid = u64::from_le_bytes(
+                    body[cursor + WAL_REC_XID_OXID_OFFSET
+                        ..cursor + WAL_REC_XID_OXID_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                max_oxid = Some(match max_oxid {
+                    Some(prev) => prev.max(oxid),
+                    None => oxid,
+                });
+                WAL_REC_XID_LEN
+            }
+            wal_rec_type::COMMIT => {
+                if cursor + WAL_REC_FINISH_LEN > body.len() {
+                    break;
+                }
+                let csn = u64::from_le_bytes(
+                    body[cursor + WAL_REC_FINISH_CSN_OFFSET
+                        ..cursor + WAL_REC_FINISH_CSN_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                max_csn = Some(match max_csn {
+                    Some(prev) => prev.max(csn),
+                    None => csn,
+                });
+                WAL_REC_FINISH_LEN
+            }
+            wal_rec_type::ROLLBACK => {
+                // ROLLBACK shares WALRecFinish layout but carries
+                // COMMITSEQNO_ABORTED — we must not bump next_csn.
+                if cursor + WAL_REC_FINISH_LEN > body.len() {
+                    break;
+                }
+                WAL_REC_FINISH_LEN
+            }
+            wal_rec_type::JOINT_COMMIT => {
+                if cursor + WAL_REC_JOINT_COMMIT_LEN > body.len() {
+                    break;
+                }
+                let csn = u64::from_le_bytes(
+                    body[cursor + WAL_REC_JOINT_COMMIT_CSN_OFFSET
+                        ..cursor + WAL_REC_JOINT_COMMIT_CSN_OFFSET + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                max_csn = Some(match max_csn {
+                    Some(prev) => prev.max(csn),
+                    None => csn,
+                });
+                WAL_REC_JOINT_COMMIT_LEN
+            }
+            _ => {
+                // Unknown sub-record: stop scanning. A future B.4+
+                // expansion can add more types (INSERT / UPDATE / …)
+                // once per-tree counter tracking is needed.
+                break;
+            }
+        };
+        cursor += consumed;
     }
-    if body[0] != wal_rec_type::XID {
-        return None;
-    }
-    let oxid_bytes: [u8; 8] = body[WAL_REC_XID_OXID_OFFSET..WAL_REC_XID_OXID_OFFSET + 8]
-        .try_into()
-        .expect("slice length checked above");
-    Some(u64::from_le_bytes(oxid_bytes))
+
+    (max_oxid, max_csn)
 }
 
 /// Decode a CONTAINER record payload into the summary-relevant delta.
@@ -288,9 +387,11 @@ pub fn decode_container_for_summary(payload: &[u8]) -> OrioleDbRecordDelta {
         return OrioleDbRecordDelta::default();
     };
     let body = &payload[header.body_offset..];
+    let (max_oxid, max_csn) = scan_container_body(body);
     OrioleDbRecordDelta {
         pg_xid: header.pg_xid,
-        oxid_in_body: first_oxid_from_body(body),
+        max_oxid_in_body: max_oxid,
+        max_csn_in_body: max_csn,
     }
 }
 
@@ -317,10 +418,16 @@ impl OrioleDBColdStartSummary {
         if let Some(xid) = delta.pg_xid {
             self.last_pg_xid_seen = xid;
         }
-        if let Some(oxid) = delta.oxid_in_body {
+        if let Some(oxid) = delta.max_oxid_in_body {
             let candidate = oxid.saturating_add(1);
             if candidate > self.next_oxid {
                 self.next_oxid = candidate;
+            }
+        }
+        if let Some(csn) = delta.max_csn_in_body {
+            let candidate = csn.saturating_add(1);
+            if candidate > self.next_csn {
+                self.next_csn = candidate;
             }
         }
 
@@ -352,24 +459,25 @@ impl OrioleDBColdStartSummary {
 
     /// Encode the summary into a fixed-layout, C-readable byte blob.
     ///
-    /// Wire format (all little-endian, no padding beyond what's
-    /// spelled out; total `ORIOLEDB_STATE_ENCODED_SIZE = 40 bytes`):
+    /// Wire format v2 (all little-endian, no padding beyond what's
+    /// spelled out; total `ORIOLEDB_STATE_ENCODED_SIZE = 48 bytes`):
     ///
     /// ```text
     /// offset  size  field
-    /// 0       4     magic              (= ORIOLEDB_STATE_MAGIC)
-    /// 4       4     version            (= ORIOLEDB_STATE_VERSION)
-    /// 8       8     next_oxid          (u64)
-    /// 16      4     last_pg_xid_seen   (u32)
-    /// 20      4     _reserved (0)      (alignment pad for C)
-    /// 24      8     last_ingested_lsn_raw (u64)
-    /// 32      8     ingested_count     (u64)
+    /// 0       4     magic                  (= ORIOLEDB_STATE_MAGIC)
+    /// 4       4     version                (= ORIOLEDB_STATE_VERSION = 2)
+    /// 8       8     next_oxid              (u64)
+    /// 16      4     last_pg_xid_seen       (u32)
+    /// 20      4     _reserved (0)          (alignment pad for C)
+    /// 24      8     last_ingested_lsn_raw  (u64)
+    /// 32      8     ingested_count         (u64)
+    /// 40      8     next_csn               (u64)   <- NEW in v2
     /// ```
     ///
     /// Consumers: pageserver basebackup ships these bytes as
     /// `global/orioledb.state`; the C-side reader in
-    /// `pgxn/orioledb/src/checkpoint/orioledb_state.c` reads them at
-    /// shmem startup.
+    /// `pgxn/orioledb/src/checkpoint/control.c` reads them at shmem
+    /// startup.
     pub fn encode_packed(&self) -> [u8; ORIOLEDB_STATE_ENCODED_SIZE] {
         let mut buf = [0u8; ORIOLEDB_STATE_ENCODED_SIZE];
         buf[0..4].copy_from_slice(&ORIOLEDB_STATE_MAGIC.to_le_bytes());
@@ -379,6 +487,7 @@ impl OrioleDBColdStartSummary {
         // bytes 20..24 are the reserved/padding slot, already zero.
         buf[24..32].copy_from_slice(&self.last_ingested_lsn_raw.to_le_bytes());
         buf[32..40].copy_from_slice(&self.ingested_count.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.next_csn.to_le_bytes());
         buf
     }
 
@@ -402,6 +511,7 @@ impl OrioleDBColdStartSummary {
             last_pg_xid_seen: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
             last_ingested_lsn_raw: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
             ingested_count: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            next_csn: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
         })
     }
 }
@@ -436,14 +546,34 @@ mod tests {
     }
 
     /// Build a `WAL_REC_XID` sub-record body: recType + OXid(8) +
-    /// logicalXid(4) + heapXid(4) = 17 bytes. Values other than `oxid`
-    /// are filler — v0.2 does not decode them.
+    /// logicalXid(4) + heapXid(4) = 17 bytes.
     fn wal_rec_xid_bytes(oxid: u64) -> Vec<u8> {
-        let mut v = Vec::with_capacity(17);
+        let mut v = Vec::with_capacity(WAL_REC_XID_LEN);
         v.push(wal_rec_type::XID);
         v.extend_from_slice(&oxid.to_le_bytes());
         v.extend_from_slice(&0u32.to_le_bytes()); // logicalXid
         v.extend_from_slice(&0u32.to_le_bytes()); // heapXid
+        v
+    }
+
+    /// Build a `WALRecFinish` sub-record: recType + xmin(8) + csn(8)
+    /// = 17 bytes. `rec_type` is either COMMIT or ROLLBACK.
+    fn wal_rec_finish_bytes(rec_type: u8, xmin: u64, csn: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(WAL_REC_FINISH_LEN);
+        v.push(rec_type);
+        v.extend_from_slice(&xmin.to_le_bytes());
+        v.extend_from_slice(&csn.to_le_bytes());
+        v
+    }
+
+    /// Build a `WALRecJointCommit`: recType + xid(4) + xmin(8) +
+    /// csn(8) = 21 bytes.
+    fn wal_rec_joint_commit_bytes(xid: u32, xmin: u64, csn: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(WAL_REC_JOINT_COMMIT_LEN);
+        v.push(wal_rec_type::JOINT_COMMIT);
+        v.extend_from_slice(&xid.to_le_bytes());
+        v.extend_from_slice(&xmin.to_le_bytes());
+        v.extend_from_slice(&csn.to_le_bytes());
         v
     }
 
@@ -502,47 +632,106 @@ mod tests {
         ));
     }
 
-    // --- body parser tests --------------------------------------------------
+    // --- body scanner tests -------------------------------------------------
 
     #[test]
-    fn body_first_xid_extracted() {
-        let body = wal_rec_xid_bytes(0x0000_0000_0000_1234);
-        assert_eq!(first_oxid_from_body(&body), Some(0x1234));
+    fn scan_body_single_xid() {
+        let body = wal_rec_xid_bytes(0x1234);
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, Some(0x1234));
+        assert_eq!(csn, None);
     }
 
     #[test]
-    fn body_without_xid_returns_none() {
-        // recType = RELATION, not XID; v0.2 returns None.
-        let body = vec![wal_rec_type::RELATION, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(first_oxid_from_body(&body), None);
+    fn scan_body_commit_extracts_csn() {
+        let body = wal_rec_finish_bytes(wal_rec_type::COMMIT, /* xmin */ 1, /* csn */ 0xCC);
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, None);
+        assert_eq!(csn, Some(0xCC));
     }
 
     #[test]
-    fn body_too_short_returns_none() {
-        assert_eq!(first_oxid_from_body(&[]), None);
-        assert_eq!(first_oxid_from_body(&[wal_rec_type::XID, 1, 2]), None);
+    fn scan_body_rollback_does_not_bump_csn() {
+        // ROLLBACK carries COMMITSEQNO_ABORTED — must not advance
+        // next_csn. Scanner still consumes the record and continues.
+        let mut body = wal_rec_finish_bytes(wal_rec_type::ROLLBACK, 1, 0xFFFF_FFFF_FFFF_FFFF);
+        body.extend_from_slice(&wal_rec_xid_bytes(7));
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(csn, None, "ROLLBACK must not contribute to next_csn");
+        assert_eq!(oxid, Some(7), "scan continues past ROLLBACK to XID");
+    }
+
+    #[test]
+    fn scan_body_joint_commit_extracts_csn() {
+        let body = wal_rec_joint_commit_bytes(/* xid */ 5, /* xmin */ 2, /* csn */ 0xABCD);
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, None);
+        assert_eq!(csn, Some(0xABCD));
+    }
+
+    #[test]
+    fn scan_body_mixed_xid_then_commit() {
+        let mut body = wal_rec_xid_bytes(100);
+        body.extend_from_slice(&wal_rec_finish_bytes(wal_rec_type::COMMIT, 100, 555));
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, Some(100));
+        assert_eq!(csn, Some(555));
+    }
+
+    #[test]
+    fn scan_body_tracks_max_across_multiple_records() {
+        let mut body = wal_rec_xid_bytes(10);
+        body.extend_from_slice(&wal_rec_finish_bytes(wal_rec_type::COMMIT, 10, 100));
+        body.extend_from_slice(&wal_rec_xid_bytes(50));
+        body.extend_from_slice(&wal_rec_finish_bytes(wal_rec_type::COMMIT, 50, 500));
+        body.extend_from_slice(&wal_rec_xid_bytes(30));
+        body.extend_from_slice(&wal_rec_finish_bytes(wal_rec_type::COMMIT, 30, 300));
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, Some(50));
+        assert_eq!(csn, Some(500));
+    }
+
+    #[test]
+    fn scan_body_stops_at_unknown_record() {
+        // INSERT (type 5) is not decoded yet — scan stops and returns
+        // whatever was extracted up to that point.
+        let mut body = wal_rec_xid_bytes(42);
+        body.push(wal_rec_type::INSERT);
+        body.extend_from_slice(&[0u8; 20]); // garbage — should not be read
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, Some(42));
+        assert_eq!(csn, None);
+    }
+
+    #[test]
+    fn scan_body_stops_at_truncation() {
+        // XID needs 17 bytes but body gives only recType + 4.
+        let body = vec![wal_rec_type::XID, 1, 2, 3, 4];
+        let (oxid, csn) = scan_container_body(&body);
+        assert_eq!(oxid, None);
+        assert_eq!(csn, None);
     }
 
     // --- decode_container_for_summary ---------------------------------------
 
     #[test]
-    fn decode_extracts_both_pg_xid_and_body_oxid() {
-        let mut payload = build_container_payload(
+    fn decode_extracts_pg_xid_oxid_and_csn() {
+        let mut body = wal_rec_xid_bytes(0x5555_6666);
+        body.extend_from_slice(&wal_rec_finish_bytes(
+            wal_rec_type::COMMIT,
+            0x5555_6666,
+            0xAAAA_BBBB,
+        ));
+        let payload = build_container_payload(
             WAL_CONTAINER_HAS_XACT_INFO,
             Some(0xABCD),
             None,
-            &wal_rec_xid_bytes(0x5555_6666),
+            &body,
         );
         let delta = decode_container_for_summary(&payload);
         assert_eq!(delta.pg_xid, Some(0xABCD));
-        assert_eq!(delta.oxid_in_body, Some(0x5555_6666));
-
-        // With no xact_info flag, pg_xid disappears but body is still
-        // parsed.
-        payload = build_container_payload(0, None, None, &wal_rec_xid_bytes(42));
-        let delta = decode_container_for_summary(&payload);
-        assert_eq!(delta.pg_xid, None);
-        assert_eq!(delta.oxid_in_body, Some(42));
+        assert_eq!(delta.max_oxid_in_body, Some(0x5555_6666));
+        assert_eq!(delta.max_csn_in_body, Some(0xAAAA_BBBB));
     }
 
     #[test]
@@ -559,18 +748,19 @@ mod tests {
         sum.ingest_delta(
             &OrioleDbRecordDelta {
                 pg_xid: None,
-                oxid_in_body: Some(10),
+                max_oxid_in_body: Some(10),
+                max_csn_in_body: None,
             },
             100,
         )
         .unwrap();
         assert_eq!(sum.next_oxid, 11);
 
-        // Larger OXid bumps next_oxid.
         sum.ingest_delta(
             &OrioleDbRecordDelta {
                 pg_xid: None,
-                oxid_in_body: Some(25),
+                max_oxid_in_body: Some(25),
+                max_csn_in_body: None,
             },
             200,
         )
@@ -581,7 +771,8 @@ mod tests {
         sum.ingest_delta(
             &OrioleDbRecordDelta {
                 pg_xid: None,
-                oxid_in_body: Some(15),
+                max_oxid_in_body: Some(15),
+                max_csn_in_body: None,
             },
             300,
         )
@@ -590,17 +781,58 @@ mod tests {
     }
 
     #[test]
+    fn ingest_delta_updates_next_csn_monotonically() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.ingest_delta(
+            &OrioleDbRecordDelta {
+                pg_xid: None,
+                max_oxid_in_body: None,
+                max_csn_in_body: Some(1000),
+            },
+            100,
+        )
+        .unwrap();
+        assert_eq!(sum.next_csn, 1001);
+
+        // Larger CSN bumps.
+        sum.ingest_delta(
+            &OrioleDbRecordDelta {
+                pg_xid: None,
+                max_oxid_in_body: None,
+                max_csn_in_body: Some(5000),
+            },
+            200,
+        )
+        .unwrap();
+        assert_eq!(sum.next_csn, 5001);
+
+        // Smaller does not regress.
+        sum.ingest_delta(
+            &OrioleDbRecordDelta {
+                pg_xid: None,
+                max_oxid_in_body: None,
+                max_csn_in_body: Some(2500),
+            },
+            300,
+        )
+        .unwrap();
+        assert_eq!(sum.next_csn, 5001);
+    }
+
+    #[test]
     fn ingest_delta_without_oxid_leaves_next_oxid_unchanged() {
         let mut sum = OrioleDBColdStartSummary::default();
         sum.ingest_delta(
             &OrioleDbRecordDelta {
                 pg_xid: Some(77),
-                oxid_in_body: None,
+                max_oxid_in_body: None,
+                max_csn_in_body: None,
             },
             500,
         )
         .unwrap();
         assert_eq!(sum.next_oxid, 0);
+        assert_eq!(sum.next_csn, 0);
         assert_eq!(sum.last_pg_xid_seen, 77);
         assert_eq!(sum.ingested_count, 1);
     }
@@ -608,17 +840,20 @@ mod tests {
     #[test]
     fn ingest_container_record_round_trip() {
         let mut sum = OrioleDBColdStartSummary::default();
+        let mut body = wal_rec_xid_bytes(99);
+        body.extend_from_slice(&wal_rec_finish_bytes(wal_rec_type::COMMIT, 99, 7777));
         let payload = build_container_payload(
             WAL_CONTAINER_HAS_XACT_INFO,
             Some(0x1111),
             None,
-            &wal_rec_xid_bytes(99),
+            &body,
         );
         sum.ingest_container_record(&payload, 1000).unwrap();
         assert_eq!(sum.ingested_count, 1);
         assert_eq!(sum.last_ingested_lsn_raw, 1000);
         assert_eq!(sum.last_pg_xid_seen, 0x1111);
         assert_eq!(sum.next_oxid, 100);
+        assert_eq!(sum.next_csn, 7778);
     }
 
     #[test]
@@ -673,10 +908,23 @@ mod tests {
         sum.last_pg_xid_seen = 0xDEADBEEF;
         sum.last_ingested_lsn_raw = 0x1122_3344_5566_7788;
         sum.ingested_count = 42;
+        sum.next_csn = 0x9999_AAAA_BBBB_CCCC;
 
         let encoded = sum.encode_packed();
+        assert_eq!(encoded.len(), 48);
         let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
         assert_eq!(decoded, sum);
+    }
+
+    #[test]
+    fn packed_v2_has_next_csn_at_offset_40() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.next_csn = 0x0123_4567_89AB_CDEF;
+        let bytes = sum.encode_packed();
+        assert_eq!(
+            u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            0x0123_4567_89AB_CDEF
+        );
     }
 
     #[test]
@@ -719,11 +967,13 @@ mod tests {
     #[test]
     fn serde_roundtrip_preserves_state() {
         let mut sum = OrioleDBColdStartSummary::default();
+        let mut body = wal_rec_xid_bytes(5000);
+        body.extend_from_slice(&wal_rec_finish_bytes(wal_rec_type::COMMIT, 5000, 999));
         let payload = build_container_payload(
             WAL_CONTAINER_HAS_XACT_INFO,
             Some(0x1234),
             None,
-            &wal_rec_xid_bytes(5000),
+            &body,
         );
         sum.ingest_container_record(&payload, 2000).unwrap();
         let encoded = serde_json::to_vec(&sum).unwrap();

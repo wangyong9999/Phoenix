@@ -265,8 +265,8 @@ write_checkpoint_control(CheckpointControl *control)
  */
 #define ORIOLEDB_STATE_FILENAME		"global/orioledb.state"
 #define ORIOLEDB_STATE_MAGIC		0x534F524Fu		/* "OROS" */
-#define ORIOLEDB_STATE_VERSION		1u
-#define ORIOLEDB_STATE_ENCODED_SIZE	40
+#define ORIOLEDB_STATE_VERSION		2u
+#define ORIOLEDB_STATE_ENCODED_SIZE	48
 
 typedef struct
 {
@@ -277,6 +277,7 @@ typedef struct
 	uint32		reserved;
 	uint64		last_ingested_lsn_raw;
 	uint64		ingested_count;
+	uint64		next_csn;		/* v2 */
 } OrioleDBStatePacked;
 
 StaticAssertDecl(sizeof(OrioleDBStatePacked) == ORIOLEDB_STATE_ENCODED_SIZE,
@@ -369,5 +370,29 @@ apply_orioledb_cold_start_summary(void)
 			 "OrioleDB cold-start: nextXid already " UINT64_FORMAT
 			 " >= summary.next_oxid " UINT64_FORMAT " (%s)",
 			 current, packed.next_oxid, ORIOLEDB_STATE_FILENAME);
+	}
+
+	/*
+	 * Bump `startupCommitSeqNo` when the summary carries a newer
+	 * next_csn. PG's StartupXLOG
+	 * (vendor/postgres-v17/src/backend/access/transam/xlog.c:5669)
+	 * writes `startupCommitSeqNo` into
+	 * `TransamVariables->nextCommitSeqNo` after our hook runs, so
+	 * modifying the global here is the correct hand-off.
+	 *
+	 * The summary's next_csn is derived from WAL_REC_COMMIT /
+	 * WAL_REC_JOINT_COMMIT sub-records ingested up to sync_lsn; it
+	 * will only be populated after the first user commit has
+	 * shipped through walingest, so on a brand-new tenant this block
+	 * is a safe no-op.
+	 */
+	if (packed.next_csn > startupCommitSeqNo)
+	{
+		elog(LOG,
+			 "OrioleDB cold-start: startupCommitSeqNo bumped "
+			 UINT64_FORMAT " -> " UINT64_FORMAT " from %s",
+			 (uint64) startupCommitSeqNo, packed.next_csn,
+			 ORIOLEDB_STATE_FILENAME);
+		startupCommitSeqNo = packed.next_csn;
 	}
 }
