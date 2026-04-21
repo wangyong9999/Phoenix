@@ -270,7 +270,7 @@ Phase 3 的主体 retirement（P3.1–P3.3）已归并进 Phase 2.1 末尾。本
 
 ---
 
-## 7 — 当前推进态（快照，v1.3 截面）
+## 7 — 当前推进态（快照，v1.4 截面 2026-04-21 晚）
 
 ```
 Phase 1a ✅ (P1.1 / P1.5 / P1.6 全闭合)
@@ -284,20 +284,34 @@ Phase 2.1 ✅ 核心路径（完整状态持久化 pipeline 通）
        - ORIOLEDB_STATE_KEY 持久化 (40 字节 packed)
        - basebackup ship global/orioledb.state
        - compute checkpoint_shmem_init 读 + 单调 bump xid_meta
-  Empirical: test_e2e_crud PASS 7/7 + state 文件在 pgdata 落位 ✅
-  未做: 默认切换到新路径（feature flag + 观察期） ⏸
-       退 orioledb_recovery.signal 路径 ⏸（Phase 3 动刀）
+  B.4 ✅ commit 4c5fd08 — summary wire v2 (加 next_csn)
+  B.5 ✅ commit 9f1bfed — o_btree_init INIT fork block 0 manifest FPI
+       (闭合 G1: SIGKILL-before-checkpoint 时 compute 找不到 tree root)
+  R9  ✅ commit cd7de5b — on-disk page header conversion on FPI emit
+  R11 ✅ commit dcd452b — SPLIT/MERGE same-blkno collision guard
+  R12 ✅ commit f9dd441 — test scripts unset HTTP_PROXY (WSL2 dev env)
+  R13 partial ✅ commit d49cf21 — force map write on signal-path EoR
 Phase 2.2 ⏸ (可随 Phase 2.1 并行启动)
 Phase 2.3 ⏸ (等 Phase 2.1 稳定)
 
-Phase 3 归并 Phase 2.1 末段
+Phase 3 ⏳ 进行中 — signal-path retirement
+  阶段 0 审计 ✅ commit 571e810 (docs/P3_PREFLIGHT_AUDIT.md)
+  阶段 1 spike ✅ commit d439a34 (lazy-load 主路径证明 viable + G1/G2 定位)
+  阶段 2 实施 ✅ commit 9f1bfed (B.5 简化版 70 行 C)
+  阶段 3a opt-in ✅ commit 3aae01a — ORIOLEDB_LAZY_RECOVERY=1 env gate
+       default 保持 signal-path; opt-in 验证:
+         * CRUD: 等价于 default (同 G2)
+         * crash_concurrent: 过 [5/10] cold-start (G1/R10 闭)，撞 G3
+  阶段 3b flip default ⏸ 需单线程 crash 测试矩阵绿化后
+  阶段 4 清理 ⏸ 阶段 3b 稳定后删 apply_btree_modify_record 调用链
 ```
 
-**下一步候选**：
-1. **C.4** feature flag / 默认路径切换（小）
-2. **B.4** 扩展 summary 字段覆盖（next_csn、undo_location_max 等，按 Q5 §2）
-3. **P3.1/P3.3** 退 `orioledb_recovery.signal` + `apply_btree_modify_record` 路径（前置：观察期、crash-matrix 验证）
-4. **R9** Page version 0 独立排查（为 crash_concurrent 解锁）
+**下一步候选**（优先级递减）：
+
+1. **crash 测试矩阵（lazy mode）** — 单线程 crash_2pc / crash_savepoint / crash_ddl / crash_mid_ckpt 在 `ORIOLEDB_LAZY_RECOVERY=1` 下跑一遍。全绿则阶段 3b 可切默认。
+2. **G3 排查** — `copy_fixed_key tuplen` assert 在 concurrent crash_concurrent [6/10]。属并发写入正确性层，与 Phase 3 架构解耦。加 elog 精定位。
+3. **G2 排查** — CRUD 的 count=0 一直在（signal-path 和 lazy 都在），说明是独立于 Phase 3 的数据流 bug。需单独调查。
+4. **Phase 1b/1c 文档补齐**（非阻塞）。
 
 ---
 
@@ -307,3 +321,4 @@ Phase 3 归并 Phase 2.1 末段
 - **v1.1 (2026-04-21)** — Phase 1 拆成 1a/1b/1c，只要 1a 是 Phase 2.1 硬前置。Phase 2 重构为 2.1（I4 关键路径串行）/ 2.2（并行硬化）/ 2.3（语义粒度）。原 Phase 2.5 Track C 并入 Phase 2.1。A.6 从条件性升为硬前置并标记 ✅ commit 1434272。R4 + R6 关闭，新增 R8（A.6 empirical 验证待完整环境回归）。加 §7 "当前推进态"快照。
 - **v1.2 (2026-04-21)** — R8 部分关闭：build env 修复（commit 80e8829 含 WSL2 port 7676 冲突 fix）+ `test_e2e_crud.sh` PASS 证实 A.6 不破 clean-shutdown。新增 R9：`test_e2e_crash_concurrent.sh` 在 [5/10] 段 `FATAL: Page version 0` 是 6.6.4c-2 类 PageServer rel_size bug，跟 A.6 正交。§7 快照反映 Phase 2.1 A.6 步完成 + 下一步指向 B.3。
 - **v1.3 (2026-04-21)** — Phase 2.1 B.3 核心路径（S1+S2+S3）全部落盘（commits 6bce2d8 / 5a85233 / 4a8f965 / 1348bd0）：walingest summary 结构 + walingest 主路径接入 + keyspace 持久化 + basebackup 投递 + compute 侧应用。`test_e2e_crud.sh` 7/7 PASS，pgdata/global/orioledb.state 文件落位验证。§7 快照更新；下一步候选为 C.4 flag 切换 / B.4 字段扩展 / Phase 3 retire / R9 排查。
+- **v1.4 (2026-04-21)** — Phase 3 进入 implementation：阶段 0 审计（commit 571e810）+ 阶段 1 spike（commit d439a34）+ 阶段 2 简化 B.5（commit 9f1bfed）+ 阶段 3a opt-in gate（commit 3aae01a）。G1 闭合（SIGKILL-before-checkpoint 时 compute 找不到 tree root），R10 在 lazy 模式下自然不触发。`ORIOLEDB_LAZY_RECOVERY=1` 做 opt-in 开关。下一步需过单线程 crash 矩阵才切默认（阶段 3b）。遗留 G2（CRUD count=0）和 G3（concurrent crash SELECT assert）独立于 Phase 3。
