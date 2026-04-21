@@ -122,10 +122,15 @@ impl MetadataRecord {
             pg_constants::RM_STANDBY_ID => Self::decode_standby_record(&mut buf, decoded)?,
             pg_constants::RM_REPLORIGIN_ID => Self::decode_replorigin_record(&mut buf, decoded)?,
             // OrioleDB custom resource manager (ID 129)
-            // Row-level WAL — no block references, stored as relation-level stream
+            // Row-level WAL — no block references, stored as relation-level stream.
+            // Decode summary-relevant fields (pg_xid from xact_info header,
+            // OXid from first WAL_REC_XID sub-record) so walingest can maintain
+            // its OrioleDB cold-start summary without re-parsing.
+            // See libs/wal_decoder/src/orioledb_state.rs (Phase 2.1 B.3).
             129 => {
                 tracing::debug!("OrioleDB WAL container record at LSN {}", next_record_lsn);
-                Some(MetadataRecord::OrioleDb)
+                let delta = crate::orioledb_state::decode_container_for_summary(buf.chunk());
+                Some(MetadataRecord::OrioleDb(delta))
             }
             _unexpected => {
                 // TODO: consider failing here instead of blindly doing something without

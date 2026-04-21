@@ -45,6 +45,7 @@ use utils::rate_limit::RateLimit;
 use utils::{critical_timeline, failpoint_support};
 use wal_decoder::models::record::NeonWalRecord;
 use wal_decoder::models::*;
+use wal_decoder::orioledb_state::OrioleDBColdStartSummary;
 
 use crate::ZERO_PAGE;
 use crate::context::RequestContext;
@@ -98,6 +99,11 @@ pub struct WalIngest {
     checkpoint: CheckPoint,
     checkpoint_modified: bool,
     warn_ingest_lag: WarnIngestLag,
+    /// OrioleDB cold-start summary, derived from the rmid=129 stream
+    /// as it is ingested. Phase 2.1 B.3 currently tracks
+    /// `next_oxid` + bookkeeping only; B.4 expands coverage. Phase 2.1
+    /// C.1/C.2 will ship this to compute via basebackup.
+    pub(crate) oriole_summary: OrioleDBColdStartSummary,
 }
 
 struct WarnIngestLag {
@@ -222,6 +228,7 @@ impl WalIngest {
                 future_lsn_msg_ratelimit: RateLimit::new(std::time::Duration::from_secs(10)),
                 timestamp_invalid_msg_ratelimit: RateLimit::new(std::time::Duration::from_secs(10)),
             },
+            oriole_summary: OrioleDBColdStartSummary::default(),
         })
     }
 
@@ -347,12 +354,24 @@ impl WalIngest {
             Some(MetadataRecord::Replorigin(rec)) => {
                 self.ingest_replorigin_record(rec, modification).await?;
             }
-            Some(MetadataRecord::OrioleDb) => {
-                // OrioleDB WAL: no per-page metadata to process.
-                // The actual WAL data is stored via the batch (serialized_batch)
-                // under ORIOLEDB_WAL_KEY_PREFIX keys.
-                // Page materialization happens in wal-redo when GetPage is called.
-                tracing::debug!("OrioleDB WAL container record ingested");
+            Some(MetadataRecord::OrioleDb(ref delta)) => {
+                // OrioleDB WAL container: no per-page metadata to process.
+                // Block-ref data (if any) flows through serialized_batch /
+                // ORIOLEDB_WAL_KEY_PREFIX keys; page materialization happens
+                // in wal-redo on GetPage. Here we update the cold-start
+                // summary from the decoder-extracted delta (Phase 2.1 B.3).
+                if let Err(err) = self
+                    .oriole_summary
+                    .ingest_delta(delta, interpreted.next_record_lsn.0)
+                {
+                    // Non-monotonic LSN or malformed payload is a caller
+                    // invariant violation; log and continue, do not halt
+                    // ingest on the summary side.
+                    tracing::warn!(
+                        "OrioleDB summary ingest skipped at LSN {}: {err:?}",
+                        interpreted.next_record_lsn
+                    );
+                }
             }
             None => {
                 // There are two cases through which we end up here:

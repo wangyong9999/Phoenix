@@ -130,7 +130,9 @@ pub enum MetadataRecord {
     Replorigin(ReploriginRecord),
     /// OrioleDB WAL container — stored as relation-level WAL stream,
     /// not per-page. PageServer uses tree-level replay via wal-redo.
-    OrioleDb,
+    /// Payload carries the summary-relevant fields extracted by the
+    /// decoder; see `wal_decoder::orioledb_state`.
+    OrioleDb(crate::orioledb_state::OrioleDbRecordDelta),
 }
 
 #[derive(Clone, Serialize, Deserialize)]
