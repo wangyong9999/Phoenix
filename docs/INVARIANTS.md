@@ -271,12 +271,17 @@ Any claim here that can't be traced to a verified anchor is marked
 These remain uncommitted. Each requires a targeted code read before a
 design decision depends on it.
 
-1. **I5-write compliance of M1.2 / M1.3.** Which record flushes first —
-   commit-barrier sys-tree writes, or XACT_COMMIT? The current
-   phrasing in `ENTERPRISE_HARDENING_PLAN.md` ("commit barrier flushes
-   undo/xidmap before XACT_COMMIT") suggests a potential I5-write
-   violation. Needs direct read of `current_oxid_commit` +
-   `RecordTransactionCommit` ordering.
+1. ~~**I5-write compliance of M1.2 / M1.3.**~~ **Closed 2026-04-21 —
+   violation confirmed** (`docs/P1_6_I5_WRITE_AUDIT.md`). M1.2/M1.3
+   emit WAL records *after* `RecordTransactionCommit` has already
+   flushed `XACT_COMMIT` to SafeKeeper, and those records are not
+   themselves force-flushed. Window between commit return and next
+   WAL-writer cycle can lose Oriole-side commit state (xidmap CSN +
+   undo FPIs) while PG-side commit is durable. Resolution: single
+   `XLogFlush(GetXLogInsertRecPtr())` at end of `current_oxid_commit`
+   under `smgr_hook != NULL` (tracked as Track A.6 in
+   `docs/EXECUTION_PLAN.md`). Firm Phase 2 prerequisite: A.6 must
+   land before `orioledb_recovery.signal` retirement.
 2. **Completeness of the OrioleDB shmem startup inventory.** Q5 in
    `MVP_FIRST_PRINCIPLES.md` lists the candidate items. Each one must
    be traced: does its value live in a sys-tree key or a
