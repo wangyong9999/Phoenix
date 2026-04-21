@@ -168,6 +168,30 @@ pub enum IngestError {
     },
 }
 
+// --- Packed wire format (C-readable) ----------------------------------------
+
+/// Magic identifying the OrioleDB cold-start summary blob on disk.
+/// ASCII "OROS" (Oriole State) in little-endian.
+pub const ORIOLEDB_STATE_MAGIC: u32 = 0x534F524F;
+
+/// Wire-format version. Bump when fields or layout change; the C-side
+/// reader (`pgxn/orioledb/src/...`) must be updated accordingly.
+pub const ORIOLEDB_STATE_VERSION: u32 = 1;
+
+/// Fixed wire-format size for `ORIOLEDB_STATE_VERSION == 1`.
+/// See `encode_packed` for the byte layout.
+pub const ORIOLEDB_STATE_ENCODED_SIZE: usize = 40;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// Byte slice too short for the declared version.
+    TooShort,
+    /// Magic prefix did not match `ORIOLEDB_STATE_MAGIC`.
+    BadMagic(u32),
+    /// Version is beyond what this reader understands.
+    UnsupportedVersion(u32),
+}
+
 impl From<ContainerParseError> for IngestError {
     fn from(err: ContainerParseError) -> Self {
         Self::Parse(err)
@@ -324,6 +348,61 @@ impl OrioleDBColdStartSummary {
         let _ = parse_container_header(payload)?;
         let delta = decode_container_for_summary(payload);
         self.ingest_delta(&delta, next_record_lsn_raw)
+    }
+
+    /// Encode the summary into a fixed-layout, C-readable byte blob.
+    ///
+    /// Wire format (all little-endian, no padding beyond what's
+    /// spelled out; total `ORIOLEDB_STATE_ENCODED_SIZE = 40 bytes`):
+    ///
+    /// ```text
+    /// offset  size  field
+    /// 0       4     magic              (= ORIOLEDB_STATE_MAGIC)
+    /// 4       4     version            (= ORIOLEDB_STATE_VERSION)
+    /// 8       8     next_oxid          (u64)
+    /// 16      4     last_pg_xid_seen   (u32)
+    /// 20      4     _reserved (0)      (alignment pad for C)
+    /// 24      8     last_ingested_lsn_raw (u64)
+    /// 32      8     ingested_count     (u64)
+    /// ```
+    ///
+    /// Consumers: pageserver basebackup ships these bytes as
+    /// `global/orioledb.state`; the C-side reader in
+    /// `pgxn/orioledb/src/checkpoint/orioledb_state.c` reads them at
+    /// shmem startup.
+    pub fn encode_packed(&self) -> [u8; ORIOLEDB_STATE_ENCODED_SIZE] {
+        let mut buf = [0u8; ORIOLEDB_STATE_ENCODED_SIZE];
+        buf[0..4].copy_from_slice(&ORIOLEDB_STATE_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&ORIOLEDB_STATE_VERSION.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.next_oxid.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.last_pg_xid_seen.to_le_bytes());
+        // bytes 20..24 are the reserved/padding slot, already zero.
+        buf[24..32].copy_from_slice(&self.last_ingested_lsn_raw.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.ingested_count.to_le_bytes());
+        buf
+    }
+
+    /// Decode a packed blob produced by `encode_packed`. Validates
+    /// magic + version; unknown versions are rejected to keep the
+    /// C-side reader strict.
+    pub fn decode_packed(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < ORIOLEDB_STATE_ENCODED_SIZE {
+            return Err(DecodeError::TooShort);
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != ORIOLEDB_STATE_MAGIC {
+            return Err(DecodeError::BadMagic(magic));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        if version != ORIOLEDB_STATE_VERSION {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
+        Ok(Self {
+            next_oxid: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            last_pg_xid_seen: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            last_ingested_lsn_raw: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            ingested_count: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+        })
     }
 }
 
@@ -567,6 +646,75 @@ mod tests {
             .expect_err("too-short payload must error");
         assert!(matches!(err, IngestError::Parse(ContainerParseError::TooShort)));
     }
+
+    // --- packed wire format -------------------------------------------------
+
+    #[test]
+    fn packed_default_matches_expected_bytes() {
+        let sum = OrioleDBColdStartSummary::default();
+        let bytes = sum.encode_packed();
+        assert_eq!(bytes.len(), ORIOLEDB_STATE_ENCODED_SIZE);
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            ORIOLEDB_STATE_MAGIC
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            ORIOLEDB_STATE_VERSION
+        );
+        // All data fields are zero in a default summary.
+        assert_eq!(&bytes[8..40], &[0u8; 32]);
+    }
+
+    #[test]
+    fn packed_roundtrip_preserves_fields() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.next_oxid = 0x0102_0304_0506_0708;
+        sum.last_pg_xid_seen = 0xDEADBEEF;
+        sum.last_ingested_lsn_raw = 0x1122_3344_5566_7788;
+        sum.ingested_count = 42;
+
+        let encoded = sum.encode_packed();
+        let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
+        assert_eq!(decoded, sum);
+    }
+
+    #[test]
+    fn packed_decode_rejects_bad_magic() {
+        let mut bytes = [0u8; ORIOLEDB_STATE_ENCODED_SIZE];
+        bytes[0..4].copy_from_slice(&0xBAD0_BAD0_u32.to_le_bytes());
+        assert!(matches!(
+            OrioleDBColdStartSummary::decode_packed(&bytes),
+            Err(DecodeError::BadMagic(_))
+        ));
+    }
+
+    #[test]
+    fn packed_decode_rejects_unsupported_version() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.next_oxid = 7;
+        let mut bytes = sum.encode_packed();
+        // Write a future version.
+        bytes[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(matches!(
+            OrioleDBColdStartSummary::decode_packed(&bytes),
+            Err(DecodeError::UnsupportedVersion(99))
+        ));
+    }
+
+    #[test]
+    fn packed_decode_rejects_truncated_input() {
+        assert!(matches!(
+            OrioleDBColdStartSummary::decode_packed(&[]),
+            Err(DecodeError::TooShort)
+        ));
+        assert!(matches!(
+            OrioleDBColdStartSummary::decode_packed(&[0u8; 10]),
+            Err(DecodeError::TooShort)
+        ));
+    }
+
+    // --- serde roundtrip (still supported for debug / introspection) --------
 
     #[test]
     fn serde_roundtrip_preserves_state() {

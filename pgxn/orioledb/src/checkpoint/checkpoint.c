@@ -375,6 +375,17 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 		pg_atomic_init_u64(&xid_meta->cleanedCheckpointXmax, control.checkpointRetainXmax);
 
 		startupCommitSeqNo = control.lastCSN;
+
+		/*
+		 * Phase 2.1 S3 (Log-is-Data cold-start): fold in any state
+		 * advanced past the checkpoint by the walingest-maintained
+		 * OrioleDB summary. This closes the window where a record
+		 * reached SafeKeeper after the last checkpoint but before
+		 * the crash, carrying an OXid that control.lastXid misses.
+		 * See `pgxn/orioledb/src/checkpoint/control.c`:
+		 * `apply_orioledb_cold_start_summary`.
+		 */
+		apply_orioledb_cold_start_summary();
 	}
 
 	LWLockRegisterTranche(checkpoint_state->oTablesMetaTrancheId,

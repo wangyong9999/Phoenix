@@ -104,4 +104,16 @@ extern bool get_checkpoint_control_data(CheckpointControl *control);
 extern void check_checkpoint_control(CheckpointControl *control);
 extern void write_checkpoint_control(CheckpointControl *control);
 
+/*
+ * Neon Log-is-Data: apply the basebackup-delivered OrioleDB cold-start
+ * summary (`PGDATA/global/orioledb.state`) on top of the values
+ * already loaded from the checkpoint control file. Bumps
+ * xid_meta->nextXid (and related xmins) when the summary advances
+ * past the control-file value — i.e. it covers the window between
+ * the last checkpoint and the LSN captured by basebackup. Safe no-op
+ * when the file is absent (tenant does not use OrioleDB). See
+ * `libs/wal_decoder/src/orioledb_state.rs` for the wire format.
+ */
+extern void apply_orioledb_cold_start_summary(void);
+
 #endif							/* __CHECKPOINT_CONTROL_H__ */

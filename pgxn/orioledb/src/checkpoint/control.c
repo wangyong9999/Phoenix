@@ -31,6 +31,8 @@
 
 #include "utils/wait_event.h"
 
+#include "transam/oxid.h"	/* xid_meta */
+
 /*
  * Read checkpoint control file data from the disk.
  *
@@ -233,5 +235,139 @@ write_checkpoint_control(CheckpointControl *control)
 				 control->lastCheckpointNumber,
 				 LSN_FORMAT_ARGS(control->replayStartPtr));
 		}
+	}
+}
+
+/*
+ * Cold-start summary — basebackup-delivered complement to the
+ * checkpoint control file.
+ *
+ * The control file is written at checkpoint time, so on cold-start
+ * (stateless restart), xid_meta->nextXid loaded from it can be stale
+ * relative to `sync_lsn` — OXids allocated after the last checkpoint
+ * but before the crash will have advanced beyond control->lastXid.
+ *
+ * The walingest-maintained summary (`ORIOLEDB_STATE_KEY` in
+ * PageServer keyspace, shipped as `PGDATA/global/orioledb.state` in
+ * basebackup) covers that tail. It is derived from the rmid=129
+ * stream as walingest processes it, so its `next_oxid` field is
+ * the largest OXid ever referenced in a record that reached
+ * SafeKeeper — exactly what compute needs to seed `xid_meta->nextXid`.
+ *
+ * See `libs/wal_decoder/src/orioledb_state.rs`: `encode_packed`
+ * emits the wire format this reader consumes.
+ *
+ * Design choices: the summary only *advances* fields — never
+ * regresses. Absence of the file is a valid state (tenant has never
+ * written rmid=129 traffic). Bad magic / version is logged at LOG
+ * level and ignored, matching the "forward-compatible" posture of
+ * the checkpoint control file itself.
+ */
+#define ORIOLEDB_STATE_FILENAME		"global/orioledb.state"
+#define ORIOLEDB_STATE_MAGIC		0x534F524Fu		/* "OROS" */
+#define ORIOLEDB_STATE_VERSION		1u
+#define ORIOLEDB_STATE_ENCODED_SIZE	40
+
+typedef struct
+{
+	uint32		magic;
+	uint32		version;
+	uint64		next_oxid;
+	uint32		last_pg_xid_seen;
+	uint32		reserved;
+	uint64		last_ingested_lsn_raw;
+	uint64		ingested_count;
+} OrioleDBStatePacked;
+
+StaticAssertDecl(sizeof(OrioleDBStatePacked) == ORIOLEDB_STATE_ENCODED_SIZE,
+				 "OrioleDBStatePacked size must match the Rust encoder");
+
+void
+apply_orioledb_cold_start_summary(void)
+{
+	File		fd;
+	OrioleDBStatePacked packed;
+	int			nread;
+	OXid		current;
+
+	fd = PathNameOpenFile(ORIOLEDB_STATE_FILENAME, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+	{
+		/*
+		 * Not an error: most paths won't have a summary yet (fresh
+		 * tenant, non-OrioleDB tenant, or basebackup from a
+		 * pageserver that predates Phase 2.1 C.2).
+		 */
+		return;
+	}
+
+	nread = FileRead(fd, (char *) &packed, sizeof(packed), 0,
+					 WAIT_EVENT_SLRU_READ);
+	FileClose(fd);
+
+	if (nread != sizeof(packed))
+	{
+		elog(LOG,
+			 "OrioleDB cold-start summary %s: truncated (%d / %zu bytes)",
+			 ORIOLEDB_STATE_FILENAME, nread, sizeof(packed));
+		return;
+	}
+
+	if (packed.magic != ORIOLEDB_STATE_MAGIC)
+	{
+		elog(LOG,
+			 "OrioleDB cold-start summary %s: bad magic 0x%08x (expected 0x%08x)",
+			 ORIOLEDB_STATE_FILENAME, packed.magic, ORIOLEDB_STATE_MAGIC);
+		return;
+	}
+
+	if (packed.version != ORIOLEDB_STATE_VERSION)
+	{
+		elog(LOG,
+			 "OrioleDB cold-start summary %s: unsupported version %u (expected %u)",
+			 ORIOLEDB_STATE_FILENAME, packed.version,
+			 ORIOLEDB_STATE_VERSION);
+		return;
+	}
+
+	/*
+	 * Bump xid_meta->nextXid if the summary advances past the
+	 * checkpoint-control-file value. Summary never regresses — it
+	 * is at least as new as the control file (both are derived from
+	 * records ≤ sync_lsn).
+	 */
+	current = pg_atomic_read_u64(&xid_meta->nextXid);
+	if (packed.next_oxid > current)
+	{
+		pg_atomic_write_u64(&xid_meta->nextXid, packed.next_oxid);
+		if (pg_atomic_read_u64(&xid_meta->runXmin) < packed.next_oxid)
+			pg_atomic_write_u64(&xid_meta->runXmin, packed.next_oxid);
+		if (pg_atomic_read_u64(&xid_meta->globalXmin) < packed.next_oxid)
+			pg_atomic_write_u64(&xid_meta->globalXmin, packed.next_oxid);
+		if (pg_atomic_read_u64(&xid_meta->lastXidWhenUpdatedGlobalXmin) < packed.next_oxid)
+			pg_atomic_write_u64(&xid_meta->lastXidWhenUpdatedGlobalXmin,
+								packed.next_oxid);
+		if (pg_atomic_read_u64(&xid_meta->writtenXmin) < packed.next_oxid)
+			pg_atomic_write_u64(&xid_meta->writtenXmin, packed.next_oxid);
+		if (pg_atomic_read_u64(&xid_meta->writeInProgressXmin) < packed.next_oxid)
+			pg_atomic_write_u64(&xid_meta->writeInProgressXmin, packed.next_oxid);
+		if (pg_atomic_read_u64(&xid_meta->cleanedXmin) < packed.next_oxid)
+			pg_atomic_write_u64(&xid_meta->cleanedXmin, packed.next_oxid);
+
+		elog(LOG,
+			 "OrioleDB cold-start: nextXid bumped " UINT64_FORMAT " -> " UINT64_FORMAT
+			 " from %s (ingested_count=" UINT64_FORMAT
+			 ", last_lsn=%X/%X)",
+			 current, packed.next_oxid, ORIOLEDB_STATE_FILENAME,
+			 packed.ingested_count,
+			 (uint32) (packed.last_ingested_lsn_raw >> 32),
+			 (uint32) packed.last_ingested_lsn_raw);
+	}
+	else
+	{
+		elog(DEBUG1,
+			 "OrioleDB cold-start: nextXid already " UINT64_FORMAT
+			 " >= summary.next_oxid " UINT64_FORMAT " (%s)",
+			 current, packed.next_oxid, ORIOLEDB_STATE_FILENAME);
 	}
 }

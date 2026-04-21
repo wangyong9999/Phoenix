@@ -412,12 +412,14 @@ impl WalIngest {
 
         // Similarly, persist the OrioleDB cold-start summary when the
         // just-ingested record advanced any of its fields. The put
-        // lands at ORIOLEDB_STATE_KEY and is read by Phase 2.1 C.2
-        // basebackup emission to ship to compute at cold-start.
+        // lands at ORIOLEDB_STATE_KEY and is read by basebackup (C.2)
+        // to ship to compute at cold-start. Encoding is the fixed
+        // packed format so the C-side reader in
+        // `pgxn/orioledb/src/checkpoint/orioledb_state.c` can
+        // deserialize without a bincode dependency.
         if self.oriole_summary_modified {
-            let bytes = bincode::serialize(&self.oriole_summary)
-                .expect("OrioleDBColdStartSummary bincode::serialize cannot fail");
-            modification.put_orioledb_state(Bytes::from(bytes))?;
+            let bytes = self.oriole_summary.encode_packed();
+            modification.put_orioledb_state(Bytes::copy_from_slice(&bytes))?;
             self.oriole_summary_modified = false;
         }
 
