@@ -1,6 +1,6 @@
 # OrioleDB-on-Neon — Execution Plan
 
-> **Status:** v1.2 — 2026-04-21.
+> **Status:** v1.3 — 2026-04-21.
 >
 > **Purpose:** 把 "设计问题 Q1–Q5" 与 "实施接口 E1–E4" 之间的协同关系、
 > 门禁、风险点写清楚，作为后续每个 PR 的上位 checklist。
@@ -266,23 +266,34 @@ Phase 3 的主体 retirement（P3.1–P3.3）已归并进 Phase 2.1 末尾。本
 
 ---
 
-## 7 — 当前推进态（快照，v1.2 截面）
+## 7 — 当前推进态（快照，v1.3 截面）
 
 ```
 Phase 1a ✅ (P1.1 / P1.5 / P1.6 全闭合)
 Phase 1b ⏳ (Q2/Q3/Q4 pending，但不阻塞)
 Phase 1c ⏳ (P1.7，小工作)
 
-Phase 2.1 ⏳ (A.6 ✅ commit 1434272 + 部分 empirical 验证 ✅ commit 80e8829;
-             test_e2e_crud PASS 确认无回归；crash_concurrent 被 R9 阻塞；
-             B.3 walingest OrioleDB summary structure 为下一步)
+Phase 2.1 ✅ 核心路径（完整状态持久化 pipeline 通）
+  A.6 ✅ commit 1434272 — XLogFlush barrier
+  B.3 ✅ commit 5a85233/4a8f965/1348bd0 (S1+S2+S3):
+       - walingest 消费 rmid=129 维护 OrioleDBColdStartSummary
+       - ORIOLEDB_STATE_KEY 持久化 (40 字节 packed)
+       - basebackup ship global/orioledb.state
+       - compute checkpoint_shmem_init 读 + 单调 bump xid_meta
+  Empirical: test_e2e_crud PASS 7/7 + state 文件在 pgdata 落位 ✅
+  未做: 默认切换到新路径（feature flag + 观察期） ⏸
+       退 orioledb_recovery.signal 路径 ⏸（Phase 3 动刀）
 Phase 2.2 ⏸ (可随 Phase 2.1 并行启动)
 Phase 2.3 ⏸ (等 Phase 2.1 稳定)
 
 Phase 3 归并 Phase 2.1 末段
 ```
 
-**下一步**：Phase 2.1 B.3 —— walingest OrioleDB-state summary 结构设计与落地（Rust，`pageserver/src/walingest.rs` 扩展）。输入：`docs/Q5_COLDSTART_SOURCES.md §2` summary schema + §3 update rules table。
+**下一步候选**：
+1. **C.4** feature flag / 默认路径切换（小）
+2. **B.4** 扩展 summary 字段覆盖（next_csn、undo_location_max 等，按 Q5 §2）
+3. **P3.1/P3.3** 退 `orioledb_recovery.signal` + `apply_btree_modify_record` 路径（前置：观察期、crash-matrix 验证）
+4. **R9** Page version 0 独立排查（为 crash_concurrent 解锁）
 
 ---
 
@@ -291,3 +302,4 @@ Phase 3 归并 Phase 2.1 末段
 - **v1.0 (2026-04-21)** — 初稿。Q（设计问题）× E（实施接口）两维度。Phase 1–3 门禁 + DoD + 风险登记。
 - **v1.1 (2026-04-21)** — Phase 1 拆成 1a/1b/1c，只要 1a 是 Phase 2.1 硬前置。Phase 2 重构为 2.1（I4 关键路径串行）/ 2.2（并行硬化）/ 2.3（语义粒度）。原 Phase 2.5 Track C 并入 Phase 2.1。A.6 从条件性升为硬前置并标记 ✅ commit 1434272。R4 + R6 关闭，新增 R8（A.6 empirical 验证待完整环境回归）。加 §7 "当前推进态"快照。
 - **v1.2 (2026-04-21)** — R8 部分关闭：build env 修复（commit 80e8829 含 WSL2 port 7676 冲突 fix）+ `test_e2e_crud.sh` PASS 证实 A.6 不破 clean-shutdown。新增 R9：`test_e2e_crash_concurrent.sh` 在 [5/10] 段 `FATAL: Page version 0` 是 6.6.4c-2 类 PageServer rel_size bug，跟 A.6 正交。§7 快照反映 Phase 2.1 A.6 步完成 + 下一步指向 B.3。
+- **v1.3 (2026-04-21)** — Phase 2.1 B.3 核心路径（S1+S2+S3）全部落盘（commits 6bce2d8 / 5a85233 / 4a8f965 / 1348bd0）：walingest summary 结构 + walingest 主路径接入 + keyspace 持久化 + basebackup 投递 + compute 侧应用。`test_e2e_crud.sh` 7/7 PASS，pgdata/global/orioledb.state 文件落位验证。§7 快照更新；下一步候选为 C.4 flag 切换 / B.4 字段扩展 / Phase 3 retire / R9 排查。
