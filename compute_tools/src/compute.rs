@@ -1769,7 +1769,35 @@ impl ComputeNode {
                 }
             }
 
-            if sync_lsn_present {
+            // Phase 3 阶段 3a — ORIOLEDB_LAZY_RECOVERY opt-in.
+            //
+            // When ORIOLEDB_LAZY_RECOVERY=1 (or =true), skip the
+            // signal-path branch entirely: no WAL copy to pg_wal, no
+            // orioledb_recovery.signal, no skip_unmodified_trees GUC
+            // push. Compute cold-start relies on:
+            //   - basebackup carrying pg_control at latest safekeeper LSN
+            //   - walingest-maintained OrioleDBColdStartSummary (B.3/B.4)
+            //     for xid/csn state (applied by
+            //     apply_orioledb_cold_start_summary in checkpoint.c)
+            //   - Plan E INIT fork block 0 via evictable_tree_init_meta
+            //     (B.5) for per-tree rootDownlink
+            //   - page-level FPI stream via GetPage for leaves
+            //
+            // Default stays signal-path until 阶段 3b flips it after
+            // broader test-matrix validation. See
+            // docs/P3_PREFLIGHT_AUDIT.md for the empirical basis.
+            let lazy_recovery = std::env::var("ORIOLEDB_LAZY_RECOVERY")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if lazy_recovery {
+                tracing::error!(
+                    "OrioleDB recovery: Phase 3 lazy mode active \
+                     (ORIOLEDB_LAZY_RECOVERY=1); signal-path replay \
+                     disabled, cold-start via summary + GetPage"
+                );
+            }
+
+            if sync_lsn_present && !lazy_recovery {
                 // Copy SafeKeeper WAL files to pg_wal/ for replay
                 if let (Some(tid), Some(tlid)) = (spec.tenant_id, spec.timeline_id) {
                     let neon_dir = pgdata_path
