@@ -226,3 +226,49 @@ SPLIT / MERGE / PAGE_IMAGE 也是 page-level，block-keyed（已验证 R9/R11）
 4. compute 侧 `apply_orioledb_cold_start_summary`：除了现有 xid bump，还要依据 summary 重建"假 control file"，或直接把 tree roots 灌进 `checkpoint_state`。
 
 **G2 诊断先行**：不卡住阶段 2。可以并行起一个 debug elog branch 排查。
+
+---
+
+## 阶段 2 实施简化（B.5 revised, commit 9f1bfed）
+
+经核实（见下节对话和 docs/B5_SUMMARY_V3_SCHEMA.md 初稿 vs 简化），**上面的 summary v3 大改动不必要**。G1 的最小闭合方案：
+
+**改动范围**：~70 行 C，仅 OrioleDB 扩展，无 pageserver / wal_decoder / compute_tools 改动。
+
+- `page_wal.c` 新增 `orioledb_page_wal_emit_map_header(BTreeDescr *)` helper：在 INIT fork block 0 emit 一条 `ORIOLEDB_XLOG_PAGE_IMAGE`，内容为 minimal `CheckpointFileHeader{ rootDownlink, datafileLength=1, leafPagesNum=1 }`
+- `btree.c:o_btree_init` 尾部调用这个 helper（在现有 root FPI 之后）
+- **无**新 info byte；**无**新 record 类型；**无** summary schema 改动；**无** walingest / compute apply 改动
+- 依赖既有 `evictable_tree_init_meta` 的 Plan E fallback（checkpoint.c:5613-5690）lazy-load INIT fork
+
+### 为什么这个够用
+
+Root 物理位置在 Neon 模式下**不随 IUD 搬迁**——`o_btree_finish_root_split_internal` (insert.c:222) 显式保留 rootDownlink；root merge 同理。只有 checkpoint 的 COW 会搬 root，而 checkpoint 本来就发 `checkpoint_map_write_header` 覆盖 INIT fork block 0。
+
+所以 manifest 只需要在"从无到有"的那一刻发——`o_btree_init` 是唯一缺口。
+
+## 阶段 1-spike 重跑（B.5 + spike）结果
+
+2026-04-21 重跑 crash_concurrent 验证：B.5 committed + compute_tools spike 重启（skip signal-path）。
+
+- **G1 彻底闭合**：24 个 sys-tree 全部 INIT fork `smgrexists=1 nblocks=1 have_map=1`，roots 从 PageServer 成功 lazy-load。`o_tables_get` 返回 crash_concur 的 OTable 描述符（无 `Assert("o_table")`）。test 从 [5/10] 通过进入 [6/10]。
+- **R10 在 spike 配合下不触发**：无 signal-path 即无 end-of-recovery checkpoint 调用，checkpoint_ix sys-tree (1,8) 的 hang 点不被触及。R10 自然闭合于 Phase 3 阶段 3 切换默认。
+- **新 blocker（非 cold-start 域）**：[6/10] `SELECT count(*)` 撞 `Assert("tuplen <= sizeof(dst->fixedData)")` at `page_contents.c:605 copy_fixed_key`。
+
+### 新 blocker 分析（G3）
+
+- 位置：scan 遍历 leaf 页时 `copy_fixed_key` 读取 key 长度超 `OFixedKey::fixedData` 上限
+- 场景：4 个并发 backend 同时 INSERT + SIGKILL 的 leaf 页内容——有可能是并发写入+PageServer 单 blkno-per-rel 语义下 last-writer-wins 导致的 partial/stale leaf 被 GetPage 返回
+- **不**属于 cold-start 域（tree 找得到、load 成功了）。属于并发写入原子性/正确性域——该走 R17 类排查，非 Phase 3 架构层
+- 独立于 Phase 3 继续推进，与 Phase 4 concurrent-write crash 硬化并行
+
+## 对 Phase 3 整体计划的更新
+
+| 阶段 | 状态 | 下一步 |
+|---|---|---|
+| 阶段 0 审计 | ✅ 完成 | — |
+| 阶段 1 spike | ✅ 完成，路径通过 | — |
+| 阶段 2 实施 | ✅ **简化后 B.5 已 commit 9f1bfed** | — |
+| 阶段 3 切换默认 | ⏸ 下一步候选 | compute_tools 默认跳过 signal-path（可能仍需 fallback 为 option）|
+| 阶段 4 清理 | ⏸ 阶段 3 稳定后 | 删 `apply_btree_modify_record` 调用链 |
+
+**阶段 3 前置风险**：G3（concurrent-write crash）仍开放。**可以阶段 3 和 G3 解耦**——单线程工作负载（CRUD / crash_2pc / crash_savepoint 等）在 Phase 3 模式下应已通，先切它们；crash_concurrent 作为独立 R 项跟踪。
