@@ -100,11 +100,11 @@ jobs:
     name: Serverless E2E (Plan E round-trip)
     runs-on: ubuntu-latest
     needs: rust-check
-    # Skeleton job: the full stack (PG build + neon binaries + orioledb
-    # extension + E2E run) is heavy and still stabilizing. Keep it
-    # non-blocking for now so merges don't wait on flakes, but surface
-    # failures in the PR check UI.
-    continue-on-error: true
+    # The baseline test_e2e.sh (clean stop/start round-trip) is now a
+    # hard requirement — lazy cold-start is the default after Phase 3
+    # 阶段 3b (commit 06bb40b). Per-step continue-on-error is applied
+    # only to tests that hit known open Gaps (see docs/GAPS.md), so
+    # a flake-free baseline is actually enforced.
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -201,7 +201,14 @@ jobs:
         # already-built artifacts from the steps above (building the
         # full native stack twice on every push would double the
         # job time for zero added coverage).
+        #
+        # continue-on-error: true — currently blocked on G2 (see
+        # docs/GAPS.md): post-crash SELECT returns count=0 even for
+        # the pre-crash-checkpointed prefix. Same family as CRUD G2.
+        # Not caused by Phase 3 (reproduces in legacy mode too).
+        # When G2 closes, flip this back to a hard requirement.
         id: e2e_crash
+        continue-on-error: true
         run: bash scripts/test_e2e_crash_mid_ckpt.sh
         env:
           ROWS: "500"
