@@ -19,7 +19,7 @@ Closed by commit `9f1bfed` (B.5 — emit INIT fork block 0 FPI at
 o_btree_init). See `docs/B5_SUMMARY_V3_SCHEMA.md` for analysis and
 `docs/P3_PREFLIGHT_AUDIT.md` for the empirical basis.
 
-### G2 — Post-restart `SELECT count(*)` returns 0 after clean+SIGKILL paths **OPEN**
+### G2 — Post-restart `SELECT count(*)` returns 0 **OPEN (partially dissected)**
 
 **Symptom family:** `crud.sh`, `crash_mid_ckpt.sh`, `crash_savepoint.sh`
 all report `before: count=N / after: count=0` across a stop/restart or
@@ -30,26 +30,49 @@ N downlinks), but `SELECT` returns 0 rows.
 **Mode-independence:** reproduces identically in both default (lazy)
 and `ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1` paths — **not caused by Phase 3**.
 
-**Known facts (from spike diagnostics):**
-- Root page's `evictable_tree_init_meta` reports `itemsCount=35
-  level=1` (internal node with 35 downlinks), so root is there.
-- PageServer log shows **zero GetPage requests** for user-table
-  leaf block numbers during the failing SELECT.
-- Local `orioledb_data/<datoid>/<relnode>-1` data file doesn't exist
-  (Plan E, expected) — leaves must come from PageServer.
+#### Layer 1 — SPLIT/MERGE blkno collision (**closed commit `6d852c6`**)
 
-**Leading hypothesis:** 2-slot datafile (`datafileLength[chkpNum%2]`)
-vs PageServer single-blkno-per-rel semantics produces stale FPIs
-after a chkpNum parity flip. Not yet conclusively proven.
+`evictable_tree_init_meta` called `o_btree_init` (which after B.5
+allocates root extent off=0 and bumps `datafileLength[0]` to 1),
+then unconditionally wrote `file_header.datafileLength` (==0 for
+fresh tree) back — clobbering the root's reservation. Next
+ensure_extent handed out offset 0 again. SPLIT emission saw
+`left.off == right.off == 0` and the prior R11 bandaid (two
+single-block PAGE_IMAGE records at the same PageServer key) lost
+data via last-writer-wins.
 
-**Impact:** blocks `test_e2e_crash_mid_ckpt` and `test_e2e_crud` from
-serving as CI gates. Currently step-level `continue-on-error: true`
-in `phoenix-ci.yml`.
+Fix: `Max(live, file_header.datafileLength)` preserves root's
+extent. R11 bandaid removed; replaced with `Assert(left_disk !=
+right_disk)` so any new clobber fails loudly.
 
-**Tracking:** no designated owner yet. Next action: instrument
-`btree_smgr_read` + `read_page_from_disk` with elog of `chkpNum`,
-`disk_blkno`, and actual page bytes read; compare FPIs sent to
-PageServer vs bytes returned at GetPage time.
+Post-fix: zero collision warnings in CRUD workload.
+
+#### Layer 2 — Post-restart count=0 persists **OPEN**
+
+Even with layer-1 closed, `SELECT count(*)` returns 0 across
+restart. Observations at commit `6d852c6`:
+
+- O_TABLES `(1,2)` loads root chkpNum=1 off=1 itemsCount=2 ✓
+- PK tree `(5, 16476)` loads root chkpNum=1 off=71 itemsCount=35 level=1 ✓
+- Tree structure looks correct on post-restart backend.
+- Yet SELECT iterates and returns 0 rows.
+
+**Leading hypothesis for layer 2:** 2-slot datafile
+(`datafileLength[chkpNum%2]`) vs PageServer single-blkno-per-rel
+semantics. During first-session CHECKPOINT, OrioleDB COWs pages
+between slots, writing FPIs at the same PageServer key (rel, main,
+blkno) with new content at a later LSN. Last-LSN-wins retrieval
+returns COW target's content — which may be a different logical
+page than the downlink expects.
+
+**Impact:** blocks `test_e2e_crash_mid_ckpt` / `test_e2e_crud` from
+being CI hard gates. Current step-level continue-on-error in
+phoenix-ci.yml.
+
+**Next action:** instrument `btree_smgr_read` and downlink
+dereferencing in scan path. Compare FPIs at PageServer (via
+storage broker introspection) to what OrioleDB expects at each
+chkpNum.
 
 ### G3 — Concurrent-write SIGKILL produces invalid leaf tuples **OPEN**
 
