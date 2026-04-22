@@ -47,117 +47,60 @@ right_disk)` so any new clobber fails loudly.
 
 Post-fix: zero collision warnings in CRUD workload.
 
-#### Layer 2 — Post-restart count=0 persists **OPEN**
+#### Layer 2 ✅ **CLOSED** (commit `d6024d7`)
 
-Even with layer-1 closed, `SELECT count(*)` returns 0 across
-restart.
+Root cause: post-stateless-restart `startupCommitSeqNo` stayed at
+`COMMITSEQNO_FIRST_NORMAL+1` because `checkpoint_shmem_init` runs in
+postmaster where the Plan E control-file fallback in
+`get_checkpoint_control_data` is gated by `IsUnderPostmaster`. With
+`TransamVariables->nextCommitSeqNo` then lagging every persisted
+page's csn, the scan iterator's undo-rewind paths
+(`load_next_disk_leaf_page:1076` + `load_first_historical_page:228`)
+rolled every leaf back to a state before the inserts — `SELECT
+count(*)` returned 0.
 
-**Empirical findings (2026-04-22 session):**
+G3's `copy_fixed_key` tuplen assert was the same bug in a different
+guise: without `CHECKPOINT`, rewinding a leaf whose `undoLocation=0`
+read past-end-of-buffer into garbage tuple headers.
 
-- Reproduces at `ROWS=500` (PK tree grows to level-1, ~10 pages).
-  Passes at `ROWS=100` (PK tree stays level-0, 2 pages).
-  Threshold implies bug triggers once multi-split forces an
-  internal node / root-split path.
-- **G2 layer 2 and G3 share the same underlying bug.** Same
-  workload (500 INSERTs) without `CHECKPOINT` → hits G3's
-  `copy_fixed_key` tuplen assert on first post-restart SELECT.
-  With `CHECKPOINT` → silently returns 0 rows (scan still
-  traverses but filters everything out, or traverses into empty
-  pages). Single-backend — not concurrency-specific as G3's
-  original report suggested.
-- **`write_page_to_disk` is NEVER called during SQL CHECKPOINT
-  in Neon mode.** Gate at `pgxn/orioledb/src/btree/io.c:1673` was
-  never hit during instrumented CRUD runs. PageServer sees ONLY
-  per-operation FPIs from `orioledb_page_wal_leaf_insert`,
-  `orioledb_page_wal_split`, `orioledb_page_wal_emit_fpi`
-  (R22 internal-node path at `insert.c:1198`, COMPACT at
-  `insert.c:1255`, UNDO_APPLY paths).
-- Post-restart PageServer reads at PK tree (blknos 5..9 of 10
-  nblocks) return pages with valid on-disk headers
-  (`checkpointNum=1, page_version=1`). Content problem is in the
-  body (item table / tuples), not the header.
+Fix is four coupled surgical changes:
 
-**Consumer-side probe findings (same session):**
+1. `checkpoint_shmem_init`: when `get_checkpoint_control_data` fails
+   (local file absent, Plan E gated out), still run
+   `apply_orioledb_cold_start_summary` so the walingest summary
+   seeds `xid_meta` + `startupCommitSeqNo`.
+2. `apply_orioledb_cold_start_summary`: use `BasicOpenFile` + raw
+   `read()` instead of `PathNameOpenFile` — VFD cache is not
+   initialised in postmaster at this point (`SizeVfdCache > 0` assert).
+3. `read_page_from_disk`: monotonically CAS-bump `nextCommitSeqNo`
+   from the freshly-loaded page's csn, covering the gap the
+   walingest summary leaves (it only tracks csns emitted in
+   CONTAINER records; structural csn allocations via SPLIT / MERGE
+   inside a transaction never reach it).
+4. Scan iterator (`load_next_disk_leaf_page` + `load_first_historical_page`):
+   rewind targets (`downlink.csn`, `scan->oSnapshot.csn`) floor up
+   to the current monotonically bumped `nextCommitSeqNo` — a leaf
+   loaded before the counter caught up still rewinds correctly
+   (i.e., does not rewind).
 
-Dumped full `BTreePageHeader` body (flags, level, itemsCount,
-chunksCount, dataSize, undoLocation, csn) from `btree_smgr_read`
-on every post-restart full-page smgr fetch:
+**Validation:** `test_e2e` (100 rows), `test_e2e_crud` (500, 5000
+rows), `crash_savepoint`, `crash_ddl` all round-trip through
+stateless restart with matching checksums.
 
-- PK tree (5,16476), 500-row workload:
-  - blkno=7: root, level=1, itemsCount=3 (3 downlinks) ✓
-  - blkno=4: leaf, itemsCount=172, csn=30 ✓
-  - blkno=5: leaf, itemsCount=170, csn=31 ✓
-  - blkno=6: leaf, itemsCount=158, csn=31 ✓
-  - **Total 172+170+158=500 tuples present in materialized pages**.
-- Root downlinks correctly resolve to leaf blknos; tree traversal
-  reaches all three data leaves.
-- `oxid_get_csn` instrumentation (static probe counter at
-  `oxid.c:1648`) logs 0 lookups from the post-restart backend
-  during the failing `SELECT count(*)`. **The scan doesn't
-  reach the per-tuple visibility check at all.**
+**Remaining gap (not G2-L2):** `crash_mid_ckpt` post-restart count
+matches pre-crash (1000/1000) but checksum differs — a narrow
+SIGKILL-mid-checkpoint race where some committed mutations in the
+window between last WAL flush and kill are lost. Separate
+investigation.
 
-**Sharpened hypothesis (shifted from I3 to scan-layer):**
+### G3 — `copy_fixed_key` tuplen assert ✅ **CLOSED** (commit `d6024d7`)
 
-Bug is in the **scan iterator** — tree descent reaches leaves
-(verified by PageServer read traffic) but the sequential scan
-returns zero rows without invoking visibility. Suspect areas:
-
-- `init_btree_seq_scan` / `init_checkpoit_number` at
-  `pgxn/orioledb/src/btree/scan.c:1106-1146` — if `numSeqScans`
-  arithmetic or `checkpointNumber` acquisition misreads
-  `metaPage` under the fresh-compute, fresh-shmem init sequence,
-  subsequent page-load may skip items.
-- `init_page_find_context(... scan->oSnapshot.csn ...)` at
-  `scan.c:1245` — scan's snapshot CSN initialization post-restart
-  may land on a sentinel that filters all items before the
-  per-tuple `oxid_get_csn` hook.
-- `page_load_and_fix` equivalent — once a page is loaded,
-  `read_page_from_disk` zeros `o_header[0..16)` and restores only
-  `checkpointNum`. In-memory `state=0, pageChangeCount=0`. If the
-  scan iterator asserts on `pageChangeCount` matching an earlier
-  captured value (e.g. from downlink), it may silently bail.
-
-**Rejected hypotheses (from this session):**
-
-- 2-slot `datafileLength[chkpNum%2]` vs single-blkno-per-rel
-  keyspace — in non-S3 mode the checkpoint COW emit path is
-  never reached, so no slot-collision opportunity exists.
-- FPI-emit content corruption (split / R22 internal-node) — ruled
-  out by consumer probe: pages materialize with correct items.
-- MVCC / commit-barrier / xidmap gap (I5) — ruled out by
-  `oxid_get_csn` probe: visibility check is never invoked.
-
-**Impact:** blocks `test_e2e_crash_mid_ckpt` / `test_e2e_crud` from
-being CI hard gates. Current step-level continue-on-error in
-phoenix-ci.yml.
-
-**Next action.** Instrument `init_btree_seq_scan` entry and the
-iterator's per-page "should we iterate items" decision. Compare
-first-session vs. post-restart values of `scan->checkpointNumber`,
-`scan->oSnapshot.csn`, and any early-exit paths. 100-row case
-passes → baseline for diffing the exact breakpoint at 500-row.
-
-### G3 — `copy_fixed_key` tuplen assert on post-restart SELECT **OPEN**
-
-**Symptom:** Post-restart SELECT hits
-`Assert("tuplen <= sizeof(dst->fixedData)")` in
-`pgxn/orioledb/src/btree/page_contents.c:605 copy_fixed_key`.
-
-**Reproduction (revised 2026-04-22):** single-backend workload of
-500 INSERTs + stateless restart (no `CHECKPOINT`) triggers this
-assert — originally reported under `test_e2e_crash_concurrent.sh`
-but NOT concurrency-specific. Adding a `CHECKPOINT` before the
-restart masks the assert and instead yields G2-layer-2 silent
-count=0. Same underlying bug in two guises.
-
-**Hypothesis (revised):** FPI emitted by the split path
-(`orioledb_page_wal_split`) or the R22 internal-node downlink path
-(`orioledb_page_wal_emit_fpi` at `insert.c:1198`) captures an
-internally inconsistent page — item count / tuple-size header /
-data region mismatch — and a post-restart scan dereferences a
-tuple whose declared length exceeds the fixed key buffer.
-
-**Impact:** merged with G2 layer 2 — fixing either fixes both.
+Merged with G2 layer 2 — same root cause. The assert fired when
+`load_first_historical_page` tried to walk undo starting from
+`undoLocation=0` (the leftmost leaf's undo pointer), reading past
+end-of-buffer into garbage tuple headers. With G2-L2's CSN counter
+seed fix, the rewind loop no longer triggers post-restart, and the
+garbage read is avoided.
 
 ### G4 — `test_e2e_crash_compressed` checkpointer assert **OPEN**
 
@@ -267,8 +210,8 @@ tracked separately).
 
 | Category | Count | Notes |
 |---|---|---|
-| ✅ Closed | 4 | G1, R11, R12, plus R13 superseded |
-| 🔴 Open (correctness) | 4 | G2, G3, G4, G6 |
+| ✅ Closed | 6 | G1, G2, G3, R11, R12, plus R13 superseded |
+| 🔴 Open (correctness) | 2 | G4 (compressed), G6 (env) |
 | 🟡 Feature gap | 3 | G5, F2, F3 |
 | ⏸ Phase 4 cleanup | 4 | delete dead signal-path code |
-| ⏳ CI lifted to hard-required after | G2 fix | then flip step-level `continue-on-error` |
+| ⏳ CI lifted to hard-required | G2 fix landed | flip step-level `continue-on-error` now safe |
