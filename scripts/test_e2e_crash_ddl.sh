@@ -24,6 +24,12 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PATH="$PROJECT_DIR/pg_install/v17/bin:$PATH"
 
+# WSL2 dev env: neon_local's HTTP health probe of compute_ctl on
+# 127.0.0.1 can get hijacked by a shell-level HTTP proxy (e.g. Clash)
+# even though no_proxy mentions 127.*. Drop proxy vars so all localhost
+# HTTP traffic in this test goes direct. No effect in CI.
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
 ROWS="${ROWS:-50}"
 ENDPOINT_NAME="${ENDPOINT_NAME:-main}"
 PSQL_DB="${PSQL_DB:-postgres}"
@@ -66,6 +72,13 @@ section "[1/10] Reset .neon + init + start + tenant + endpoint"
 cargo neon stop >/dev/null 2>&1 || true
 rm -rf .neon
 cargo neon init
+# WSL2 infra workaround: Windows host may squat on 127.0.0.1:7676 (e.g. Clash).
+# Only rewrite the safekeeper http_port when the default is actually occupied.
+if (exec 3<>/dev/tcp/127.0.0.1/7676) 2>/dev/null; then
+    exec 3>&- 3<&-
+    echo "note: port 7676 busy on host — rewriting safekeeper http_port to 17676"
+    sed -i 's/http_port = 7676/http_port = 17676/' .neon/config
+fi
 cargo neon start
 sleep 3
 cargo neon tenant create --set-default
