@@ -593,16 +593,15 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	right_page = O_GET_IN_MEMORY_PAGE(right_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
 
-	if (left_disk == right_disk)
-	{
-		elog(WARNING,
-			 "OrioleDB SPLIT: left_disk == right_disk == %u for rel (%u,%u); "
-			 "emitting as two single-block PAGE_IMAGE records",
-			 left_disk, rlocator.dbOid, rlocator.relNumber);
-		orioledb_page_wal_emit_fpi(desc, left_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
-		orioledb_page_wal_emit_fpi(desc, right_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
-		return;
-	}
+	/*
+	 * left_disk == right_disk should be impossible after G2 fix in
+	 * evictable_tree_init_meta preserves root's pre-allocated extent.
+	 * If we hit it, it means some new code path is clobbering
+	 * datafileLength. Assert hard to catch regressions loudly; the
+	 * prior R11 workaround (emit as two single-block records) silently
+	 * lost data via PageServer last-writer-wins.
+	 */
+	Assert(left_disk != right_disk);
 
 	{
 		char		left_ondisk[ORIOLEDB_BLCKSZ];
@@ -649,16 +648,8 @@ orioledb_page_wal_merge(BTreeDescr *desc,
 	parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
 
-	if (left_disk == parent_disk)
-	{
-		elog(WARNING,
-			 "OrioleDB MERGE: left_disk == parent_disk == %u for rel (%u,%u); "
-			 "emitting as two single-block PAGE_IMAGE records",
-			 left_disk, rlocator.dbOid, rlocator.relNumber);
-		orioledb_page_wal_emit_fpi(desc, left_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
-		orioledb_page_wal_emit_fpi(desc, parent_blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
-		return;
-	}
+	/* Same invariant as SPLIT — see comment there. */
+	Assert(left_disk != parent_disk);
 
 	{
 		char		left_ondisk[ORIOLEDB_BLCKSZ];

@@ -5821,10 +5821,38 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 
 	meta_page = BTREE_GET_META(desc);
 	pg_atomic_write_u64(&meta_page->numFreeBlocks, file_header.numFreeBlocks);
-	if (orioledb_s3_mode)
-		pg_atomic_write_u64(&meta_page->datafileLength[chkp_num % 2], file_header.datafileLength);
-	else
-		pg_atomic_write_u64(&meta_page->datafileLength[0], file_header.datafileLength);
+	/*
+	 * G2 fix: o_btree_init may have pre-allocated the root's disk extent
+	 * (B.5 emit_fpi on the root pushes datafileLength[0] to 1 during
+	 * o_btree_init for persistence trees in Neon mode). If we then
+	 * unconditionally overwrote datafileLength with file_header's
+	 * value — zero for fresh trees — the next ensure_extent would hand
+	 * out the same offset the root already holds, causing a blkno
+	 * collision at SPLIT time and silent PageServer data loss.
+	 *
+	 * Preserve the post-o_btree_init invariant "datafileLength >=
+	 * root.fileExtent.off + 1" by taking the max of the live counter
+	 * and the saved header value. For loaded trees (map file present)
+	 * file_header.datafileLength >> 1, so Max() keeps the loaded value;
+	 * for fresh trees it keeps the root-reserved 1. See docs/GAPS.md G2.
+	 */
+	{
+		uint64 live;
+		uint64 saved = file_header.datafileLength;
+
+		if (orioledb_s3_mode)
+		{
+			live = pg_atomic_read_u64(&meta_page->datafileLength[chkp_num % 2]);
+			pg_atomic_write_u64(&meta_page->datafileLength[chkp_num % 2],
+								saved > live ? saved : live);
+		}
+		else
+		{
+			live = pg_atomic_read_u64(&meta_page->datafileLength[0]);
+			pg_atomic_write_u64(&meta_page->datafileLength[0],
+								saved > live ? saved : live);
+		}
+	}
 	pg_atomic_write_u32(&meta_page->leafPagesNum, file_header.leafPagesNum);
 	pg_atomic_write_u64(&meta_page->ctid, file_header.ctid);
 	pg_atomic_write_u64(&meta_page->bridge_ctid, file_header.bridgeCtid);
