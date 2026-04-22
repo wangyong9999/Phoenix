@@ -77,30 +77,65 @@ restart.
   (`checkpointNum=1, page_version=1`). Content problem is in the
   body (item table / tuples), not the header.
 
-**Sharpened hypothesis.** The FPI emitted by the split path
-(`orioledb_page_wal_split`) and/or the R22 internal-node downlink
-path (`orioledb_page_wal_emit_fpi` at `insert.c:1198`) captures
-an intermediate / inconsistent page state — item count vs. tuple
-data mismatch — that fails scan-time consistency checks once the
-post-restart root traverses through that page.
+**Consumer-side probe findings (same session):**
+
+Dumped full `BTreePageHeader` body (flags, level, itemsCount,
+chunksCount, dataSize, undoLocation, csn) from `btree_smgr_read`
+on every post-restart full-page smgr fetch:
+
+- PK tree (5,16476), 500-row workload:
+  - blkno=7: root, level=1, itemsCount=3 (3 downlinks) ✓
+  - blkno=4: leaf, itemsCount=172, csn=30 ✓
+  - blkno=5: leaf, itemsCount=170, csn=31 ✓
+  - blkno=6: leaf, itemsCount=158, csn=31 ✓
+  - **Total 172+170+158=500 tuples present in materialized pages**.
+- Root downlinks correctly resolve to leaf blknos; tree traversal
+  reaches all three data leaves.
+- `oxid_get_csn` instrumentation (static probe counter at
+  `oxid.c:1648`) logs 0 lookups from the post-restart backend
+  during the failing `SELECT count(*)`. **The scan doesn't
+  reach the per-tuple visibility check at all.**
+
+**Sharpened hypothesis (shifted from I3 to scan-layer):**
+
+Bug is in the **scan iterator** — tree descent reaches leaves
+(verified by PageServer read traffic) but the sequential scan
+returns zero rows without invoking visibility. Suspect areas:
+
+- `init_btree_seq_scan` / `init_checkpoit_number` at
+  `pgxn/orioledb/src/btree/scan.c:1106-1146` — if `numSeqScans`
+  arithmetic or `checkpointNumber` acquisition misreads
+  `metaPage` under the fresh-compute, fresh-shmem init sequence,
+  subsequent page-load may skip items.
+- `init_page_find_context(... scan->oSnapshot.csn ...)` at
+  `scan.c:1245` — scan's snapshot CSN initialization post-restart
+  may land on a sentinel that filters all items before the
+  per-tuple `oxid_get_csn` hook.
+- `page_load_and_fix` equivalent — once a page is loaded,
+  `read_page_from_disk` zeros `o_header[0..16)` and restores only
+  `checkpointNum`. In-memory `state=0, pageChangeCount=0`. If the
+  scan iterator asserts on `pageChangeCount` matching an earlier
+  captured value (e.g. from downlink), it may silently bail.
 
 **Rejected hypotheses (from this session):**
 
 - 2-slot `datafileLength[chkpNum%2]` vs single-blkno-per-rel
-  keyspace. Inspection: in non-S3 mode the checkpoint COW emit
-  path is unreached (see above), so no slot-collision opportunity
-  exists. The collision-keyspace theory is moot for non-S3.
+  keyspace — in non-S3 mode the checkpoint COW emit path is
+  never reached, so no slot-collision opportunity exists.
+- FPI-emit content corruption (split / R22 internal-node) — ruled
+  out by consumer probe: pages materialize with correct items.
+- MVCC / commit-barrier / xidmap gap (I5) — ruled out by
+  `oxid_get_csn` probe: visibility check is never invoked.
 
 **Impact:** blocks `test_e2e_crash_mid_ckpt` / `test_e2e_crud` from
 being CI hard gates. Current step-level continue-on-error in
 phoenix-ci.yml.
 
-**Next action.** Instrument `orioledb_page_wal_split` and
-`orioledb_page_wal_emit_fpi` emit sites: snapshot page `flags`,
-`itemsCount`, `dataSize`, first tuple's `tuple_size` before and
-after `build_ondisk_page_image`. Verify the emitted FPI content is
-internally consistent. Cross-reference with what emit sites in
-`insert.c:1198`, `split.c:459`, `insert.c:252` are capturing.
+**Next action.** Instrument `init_btree_seq_scan` entry and the
+iterator's per-page "should we iterate items" decision. Compare
+first-session vs. post-restart values of `scan->checkpointNumber`,
+`scan->oSnapshot.csn`, and any early-exit paths. 100-row case
+passes → baseline for diffing the exact breakpoint at 500-row.
 
 ### G3 — `copy_fixed_key` tuplen assert on post-restart SELECT **OPEN**
 
