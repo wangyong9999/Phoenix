@@ -180,10 +180,47 @@ See G5 above.
 `test_e2e_physrepl.sh` presumably exercises this but hasn't been
 part of recent validation matrix. Status unknown.
 
-### F3 — PITR / branching semantics with Plan E
+### F3 — PITR / branching semantics with Plan E **first-probe findings 2026-04-22**
 
-`test_e2e_pitr.sh`, `test_e2e_branching.sh` — interaction with Plan E's
-`checkpoint_map_write_header` + basebackup flow not validated.
+First validation run after G2 L2 fix (commit `d6024d7`). Both
+tests fail at **Neon-side infrastructure**, not OrioleDB:
+
+**PITR (`test_e2e_pitr.sh`):**
+- Steps [1–4] succeed: seed 1000 rows → CHECKPOINT → capture LSN_A
+  → seed 1000 more → CHECKPOINT → capture LSN_B.
+- Step [5] creates Static endpoint (`cargo neon endpoint create --lsn LSN_A`).
+- Static endpoint hangs with `waiting for WAL to become available
+  at 0/1002000` — PG startup cannot fetch WAL at target LSN from
+  PageServer/SafeKeeper. LSN 0/1002000 is pre-extension (just past
+  segment header), suggesting `--lsn LSN_A` was not plumbed through
+  to `startupCommitSeqNo` / `redo LSN` in the Static endpoint's
+  pg_control.
+- OrioleDB code is not reached; problem is upstream of compute-side
+  OrioleDB init.
+
+**Branching (`test_e2e_branching.sh`):**
+- Steps [1–5] succeed: parent seed + diverge + `cargo neon timeline
+  branch` at BRANCH_LSN.
+- Step [6] starts branched endpoint. OrioleDB side initialises
+  cleanly on the branch — summary applied correctly: `OrioleDB
+  cold-start: nextXid bumped 3 -> 43 from global/orioledb.state`
+  (so `orioledb.state` is copied into branch timeline's basebackup
+  and re-read on branched compute).
+- Fails at compute_ctl's `post_apply_config`: `extension "neon"
+  does not exist`. Neon extension SQL script not applied to
+  branched endpoint's PGDATA during basebackup / compute bring-up.
+- Again: OrioleDB layer is fine; Neon upstream init gap.
+
+**What this means for Log-is-Data claims.** The OrioleDB-side of
+branching is working (summary fork carries state correctly across
+timelines). The gaps are in Neon's Static-endpoint and
+branched-endpoint bring-up flows, which predate this work and
+need investigation in the Neon codebase (not in `pgxn/orioledb/`).
+
+**Implication for MVP claim.** Until these bring-up flows are
+fixed, Neon's two flagship differentiators — PITR + branching —
+cannot be demonstrated on OrioleDB tables, even though the
+underlying data correctness path is in place.
 
 ---
 

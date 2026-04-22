@@ -44,6 +44,9 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PATH="$PROJECT_DIR/pg_install/v17/bin:$PATH"
 
+# WSL2 dev env
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
 ROWS="${ROWS:-200}"
 ROWS_DIVERGE="${ROWS_DIVERGE:-100}"
 PARENT_ENDPOINT="${PARENT_ENDPOINT:-main}"
@@ -97,6 +100,10 @@ rm -rf .neon
 
 section "[2/9] Init + start + create tenant + parent endpoint"
 cargo neon init
+if (exec 3<>/dev/tcp/127.0.0.1/7676) 2>/dev/null; then
+    exec 3>&- 3<&-
+    sed -i 's/http_port = 7676/http_port = 17676/' .neon/config
+fi
 cargo neon start
 sleep 3
 cargo neon tenant create --set-default

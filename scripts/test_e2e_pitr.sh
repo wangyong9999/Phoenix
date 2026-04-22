@@ -30,6 +30,9 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PATH="$PROJECT_DIR/pg_install/v17/bin:$PATH"
 
+# WSL2 dev env: drop proxy vars so localhost HTTP traffic goes direct.
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+
 WRITER_ENDPOINT="${WRITER_ENDPOINT:-main}"
 PITR_A_ENDPOINT="${PITR_A_ENDPOINT:-pitr_a}"
 PITR_B_ENDPOINT="${PITR_B_ENDPOINT:-pitr_b}"
@@ -62,6 +65,11 @@ rm -rf .neon
 
 section "[2/8] Init + start + tenant + writer endpoint"
 cargo neon init
+# WSL2: port 7676 (safekeeper http) may be squatted. Rewrite only if busy.
+if (exec 3<>/dev/tcp/127.0.0.1/7676) 2>/dev/null; then
+    exec 3>&- 3<&-
+    sed -i 's/http_port = 7676/http_port = 17676/' .neon/config
+fi
 cargo neon start
 sleep 3
 cargo neon tenant create --set-default
