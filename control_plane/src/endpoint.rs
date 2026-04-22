@@ -475,6 +475,11 @@ impl Endpoint {
         conf.append("effective_io_concurrency", "2");
         conf.append("fsync", "off");
         conf.append("max_connections", "100");
+        // Allow 2PC so tests exercising PREPARE TRANSACTION (e.g.
+        // scripts/test_e2e_crash_2pc.sh) don't need to patch the
+        // endpoint's postgresql.conf themselves. 10 is the canonical
+        // upstream-test default; cost is ~260 bytes shmem per slot.
+        conf.append("max_prepared_transactions", "10");
         conf.append("wal_level", "logical");
         // wal_sender_timeout is the maximum time to wait for WAL replication.
         // It also defines how often the walreceiver will send a feedback message to the wal sender.
