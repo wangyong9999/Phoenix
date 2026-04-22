@@ -1769,35 +1769,43 @@ impl ComputeNode {
                 }
             }
 
-            // Phase 3 阶段 3a — ORIOLEDB_LAZY_RECOVERY opt-in.
+            // Phase 3 阶段 3b — lazy cold-start is now the default.
             //
-            // When ORIOLEDB_LAZY_RECOVERY=1 (or =true), skip the
-            // signal-path branch entirely: no WAL copy to pg_wal, no
-            // orioledb_recovery.signal, no skip_unmodified_trees GUC
-            // push. Compute cold-start relies on:
+            // OrioleDB cold-start relies on:
             //   - basebackup carrying pg_control at latest safekeeper LSN
             //   - walingest-maintained OrioleDBColdStartSummary (B.3/B.4)
             //     for xid/csn state (applied by
             //     apply_orioledb_cold_start_summary in checkpoint.c)
             //   - Plan E INIT fork block 0 via evictable_tree_init_meta
-            //     (B.5) for per-tree rootDownlink
+            //     (B.5, commit 9f1bfed) for per-tree rootDownlink
             //   - page-level FPI stream via GetPage for leaves
             //
-            // Default stays signal-path until 阶段 3b flips it after
-            // broader test-matrix validation. See
-            // docs/P3_PREFLIGHT_AUDIT.md for the empirical basis.
-            let lazy_recovery = std::env::var("ORIOLEDB_LAZY_RECOVERY")
+            // Signal-path (orioledb_recovery.signal + PG WAL replay of
+            // rmid=129) is the legacy fallback. Set
+            // ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1 to opt back into it
+            // while this transition settles. Phase 4 will delete the
+            // legacy path entirely.
+            //
+            // Empirical basis: docs/P3_TEST_MATRIX.md — six e2e crash
+            // tests run in both modes, zero regressions, crash_ddl
+            // PASS, crash_concurrent strictly better in lazy mode.
+            let legacy_signal = std::env::var("ORIOLEDB_LEGACY_SIGNAL_RECOVERY")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
-            if lazy_recovery {
+            if legacy_signal {
                 tracing::error!(
-                    "OrioleDB recovery: Phase 3 lazy mode active \
-                     (ORIOLEDB_LAZY_RECOVERY=1); signal-path replay \
-                     disabled, cold-start via summary + GetPage"
+                    "OrioleDB recovery: legacy signal-path mode active \
+                     (ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1); \
+                     orioledb_recovery.signal + PG WAL replay will fire"
+                );
+            } else {
+                tracing::error!(
+                    "OrioleDB recovery: Phase 3 lazy mode (default); \
+                     cold-start via summary + GetPage, no signal-path"
                 );
             }
 
-            if sync_lsn_present && !lazy_recovery {
+            if sync_lsn_present && legacy_signal {
                 // Copy SafeKeeper WAL files to pg_wal/ for replay
                 if let (Some(tid), Some(tlid)) = (spec.tenant_id, spec.timeline_id) {
                     let neon_dir = pgdata_path
