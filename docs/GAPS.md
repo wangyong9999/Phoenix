@@ -50,53 +50,79 @@ Post-fix: zero collision warnings in CRUD workload.
 #### Layer 2 — Post-restart count=0 persists **OPEN**
 
 Even with layer-1 closed, `SELECT count(*)` returns 0 across
-restart. Observations at commit `6d852c6`:
+restart.
 
-- O_TABLES `(1,2)` loads root chkpNum=1 off=1 itemsCount=2 ✓
-- PK tree `(5, 16476)` loads root chkpNum=1 off=71 itemsCount=35 level=1 ✓
-- Tree structure looks correct on post-restart backend.
-- Yet SELECT iterates and returns 0 rows.
+**Empirical findings (2026-04-22 session):**
 
-**Leading hypothesis for layer 2:** 2-slot datafile
-(`datafileLength[chkpNum%2]`) vs PageServer single-blkno-per-rel
-semantics. During first-session CHECKPOINT, OrioleDB COWs pages
-between slots, writing FPIs at the same PageServer key (rel, main,
-blkno) with new content at a later LSN. Last-LSN-wins retrieval
-returns COW target's content — which may be a different logical
-page than the downlink expects.
+- Reproduces at `ROWS=500` (PK tree grows to level-1, ~10 pages).
+  Passes at `ROWS=100` (PK tree stays level-0, 2 pages).
+  Threshold implies bug triggers once multi-split forces an
+  internal node / root-split path.
+- **G2 layer 2 and G3 share the same underlying bug.** Same
+  workload (500 INSERTs) without `CHECKPOINT` → hits G3's
+  `copy_fixed_key` tuplen assert on first post-restart SELECT.
+  With `CHECKPOINT` → silently returns 0 rows (scan still
+  traverses but filters everything out, or traverses into empty
+  pages). Single-backend — not concurrency-specific as G3's
+  original report suggested.
+- **`write_page_to_disk` is NEVER called during SQL CHECKPOINT
+  in Neon mode.** Gate at `pgxn/orioledb/src/btree/io.c:1673` was
+  never hit during instrumented CRUD runs. PageServer sees ONLY
+  per-operation FPIs from `orioledb_page_wal_leaf_insert`,
+  `orioledb_page_wal_split`, `orioledb_page_wal_emit_fpi`
+  (R22 internal-node path at `insert.c:1198`, COMPACT at
+  `insert.c:1255`, UNDO_APPLY paths).
+- Post-restart PageServer reads at PK tree (blknos 5..9 of 10
+  nblocks) return pages with valid on-disk headers
+  (`checkpointNum=1, page_version=1`). Content problem is in the
+  body (item table / tuples), not the header.
+
+**Sharpened hypothesis.** The FPI emitted by the split path
+(`orioledb_page_wal_split`) and/or the R22 internal-node downlink
+path (`orioledb_page_wal_emit_fpi` at `insert.c:1198`) captures
+an intermediate / inconsistent page state — item count vs. tuple
+data mismatch — that fails scan-time consistency checks once the
+post-restart root traverses through that page.
+
+**Rejected hypotheses (from this session):**
+
+- 2-slot `datafileLength[chkpNum%2]` vs single-blkno-per-rel
+  keyspace. Inspection: in non-S3 mode the checkpoint COW emit
+  path is unreached (see above), so no slot-collision opportunity
+  exists. The collision-keyspace theory is moot for non-S3.
 
 **Impact:** blocks `test_e2e_crash_mid_ckpt` / `test_e2e_crud` from
 being CI hard gates. Current step-level continue-on-error in
 phoenix-ci.yml.
 
-**Next action:** instrument `btree_smgr_read` and downlink
-dereferencing in scan path. Compare FPIs at PageServer (via
-storage broker introspection) to what OrioleDB expects at each
-chkpNum.
+**Next action.** Instrument `orioledb_page_wal_split` and
+`orioledb_page_wal_emit_fpi` emit sites: snapshot page `flags`,
+`itemsCount`, `dataSize`, first tuple's `tuple_size` before and
+after `build_ondisk_page_image`. Verify the emitted FPI content is
+internally consistent. Cross-reference with what emit sites in
+`insert.c:1198`, `split.c:459`, `insert.c:252` are capturing.
 
-### G3 — Concurrent-write SIGKILL produces invalid leaf tuples **OPEN**
+### G3 — `copy_fixed_key` tuplen assert on post-restart SELECT **OPEN**
 
-**Symptom:** `test_e2e_crash_concurrent.sh` at [6/10] SELECT post-restart
-hits `Assert("tuplen <= sizeof(dst->fixedData)")` in
+**Symptom:** Post-restart SELECT hits
+`Assert("tuplen <= sizeof(dst->fixedData)")` in
 `pgxn/orioledb/src/btree/page_contents.c:605 copy_fixed_key`.
 
-**Context:** only under default (lazy) mode, because signal-path
-mode hits R10 hang earlier (never reaches [6/10]).
+**Reproduction (revised 2026-04-22):** single-backend workload of
+500 INSERTs + stateless restart (no `CHECKPOINT`) triggers this
+assert — originally reported under `test_e2e_crash_concurrent.sh`
+but NOT concurrency-specific. Adding a `CHECKPOINT` before the
+restart masks the assert and instead yields G2-layer-2 silent
+count=0. Same underlying bug in two guises.
 
-**Hypothesis:** under 4 concurrent `INSERT` backends + mid-workload
-SIGKILL, two backends' `orioledb_page_wal_leaf_insert` FPIs both
-target the same `(rel, fork, blkno)`. PageServer's last-writer-wins
-at that LSN keeps the second, discarding the first. If the second
-was emitted before integrating the first's content (due to page
-lock boundary + crash timing), the surviving FPI has a half-consistent
-item table.
+**Hypothesis (revised):** FPI emitted by the split path
+(`orioledb_page_wal_split`) or the R22 internal-node downlink path
+(`orioledb_page_wal_emit_fpi` at `insert.c:1198`) captures an
+internally inconsistent page — item count / tuple-size header /
+data region mismatch — and a post-restart scan dereferences a
+tuple whose declared length exceeds the fixed key buffer.
 
-**Not blocking CI** — `test_e2e_crash_concurrent.sh` is not in
-phoenix-ci.yml.
-
-**Impact:** concurrent-workload crash safety unproven. Fix likely
-requires either commit-serialized FPI emission or a walredo merge
-strategy.
+**Impact:** merged with G2 layer 2 — fixing either fixes both.
 
 ### G4 — `test_e2e_crash_compressed` checkpointer assert **OPEN**
 
