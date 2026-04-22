@@ -14,7 +14,7 @@ header FPI) + `f98d588` (WSL2 workarounds on all crash tests).
 | `test_e2e_crash_ddl.sh` | **PASS** | **PASS** | ✅ Lazy-mode direct validation |
 | `test_e2e_crud.sh` | FAIL — G2 `count=0` post-restart | FAIL — G2 (same) | Pre-existing, not Phase 3 |
 | `test_e2e_crash_concurrent.sh` | FAIL — R10 EoR checkpoint hang at sys-tree (1,8) | FAIL — G3 `copy_fixed_key tuplen` assert at [6/10] | Lazy **strictly further** (past cold-start) |
-| `test_e2e_crash_2pc.sh` | FAIL — `max_prepared_transactions=0` infra | FAIL — same | Pre-existing infra gap |
+| `test_e2e_crash_2pc.sh` | ~~FAIL — `max_prepared_transactions=0` infra~~ post-fix commit `1c63691`: panic `compute_tools:1036` OutOfRangeError (env clock bug) | post-fix: `ERROR: cannot use PREPARE TRANSACTION in transaction that uses orioledb table` (OrioleDB structural limit) | Test unfixable without new OrioleDB feature — **abandoned as 门禁样本点** |
 | `test_e2e_crash_savepoint.sh` | FAIL — `post-crash expected 101 rows, got 0` | FAIL — same | Pre-existing, same shape as G2 |
 | `test_e2e_crash_compressed.sh` | TRAP `free_extents.c:341 cur->extent.offset < extent.off` in checkpointer | TRAP — same | Pre-existing checkpoint bug |
 
@@ -39,3 +39,22 @@ pre-existing failures 分成两类：
 **前置**（都是 small 项）：
 - [ ] 把本 matrix 加到 CI 过滤器（两模式都要跑；任何一边新增红 → 阻断）——未做，依赖 phoenix-ci.yml 扩展
 - [ ] 或者更保守：阶段 3b1 = lazy default 但保留 signal-path 代码+opt-out 路径（本 commit 的做法）；阶段 4 才删 signal-path 代码
+
+## 2026-04-22 更新: crash_2pc 扩容尝试失败
+
+原计划: 通过 `max_prepared_transactions=10` 默认修 crash_2pc 把 lazy 门禁 1 绿扩到 2 绿. 实测后放弃:
+
+1. Fix 本身有效 (commit `1c63691`): postgresql.conf 现在带 `max_prepared_transactions=10`, test 的 precheck 过.
+2. **但 lazy 模式依然失败**: 进入 PREPARE 阶段撞 `ERROR: cannot use PREPARE TRANSACTION in transaction that uses orioledb table`. OrioleDB 结构上不支持 orioledb 表的 2PC. 这是 OrioleDB feature gap, 非 Phase 3 架构问题.
+3. **Default 模式也失败 (不同错)**: compute_tools:1036 panic `OutOfRangeError` (chrono Duration), 环境 clock skew 问题. 与 Phase 3 无关.
+
+**结论**: crash_2pc 作为 lazy 门禁样本点无效, `max_prepared_transactions` fix 作为独立清理保留.
+
+### 仍可扩容的路径
+
+- **`test_e2e.sh` 基础 CRUD** (非 crash) — 如果能跑通, 等于 clean path 下 lazy 等价 default
+- **`test_e2e_concurrent.sh`** (clean shutdown + concurrent, 非 SIGKILL)
+- **`test_e2e_branching.sh`** / **`test_e2e_pitr.sh`** (Neon 特性路径)
+- **新写最小 DDL-only 测试** (无 IUD 的 tree lifecycle 覆盖)
+
+crash 系列之外的 smoke test 是否通过 matrix 也值得跑.
