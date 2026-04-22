@@ -299,11 +299,10 @@ Phase 3 ⏳ 进行中 — signal-path retirement
   阶段 1 spike ✅ commit d439a34 (lazy-load 主路径证明 viable + G1/G2 定位)
   阶段 2 实施 ✅ commit 9f1bfed (B.5 简化版 70 行 C)
   阶段 3a opt-in ✅ commit 3aae01a — ORIOLEDB_LAZY_RECOVERY=1 env gate
-       default 保持 signal-path; opt-in 验证:
-         * CRUD: 等价于 default (同 G2)
-         * crash_concurrent: 过 [5/10] cold-start (G1/R10 闭)，撞 G3
-  阶段 3b flip default ⏸ 需单线程 crash 测试矩阵绿化后
-  阶段 4 清理 ⏸ 阶段 3b 稳定后删 apply_btree_modify_record 调用链
+  阶段 3b flip default ✅ commit 06bb40b — lazy 成默认, ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1 回退
+       post-flip verify: crash_ddl PASS, crash_concurrent [6/10] G3, crud 同 G2
+       (与 3a matrix 数据 bit-for-bit 一致)
+  阶段 4 清理 ⏸ 稳定期后删 apply_btree_modify_record + signal.signal 读取端
 ```
 
 **下一步候选**（优先级递减）：
@@ -322,3 +321,4 @@ Phase 3 ⏳ 进行中 — signal-path retirement
 - **v1.2 (2026-04-21)** — R8 部分关闭：build env 修复（commit 80e8829 含 WSL2 port 7676 冲突 fix）+ `test_e2e_crud.sh` PASS 证实 A.6 不破 clean-shutdown。新增 R9：`test_e2e_crash_concurrent.sh` 在 [5/10] 段 `FATAL: Page version 0` 是 6.6.4c-2 类 PageServer rel_size bug，跟 A.6 正交。§7 快照反映 Phase 2.1 A.6 步完成 + 下一步指向 B.3。
 - **v1.3 (2026-04-21)** — Phase 2.1 B.3 核心路径（S1+S2+S3）全部落盘（commits 6bce2d8 / 5a85233 / 4a8f965 / 1348bd0）：walingest summary 结构 + walingest 主路径接入 + keyspace 持久化 + basebackup 投递 + compute 侧应用。`test_e2e_crud.sh` 7/7 PASS，pgdata/global/orioledb.state 文件落位验证。§7 快照更新；下一步候选为 C.4 flag 切换 / B.4 字段扩展 / Phase 3 retire / R9 排查。
 - **v1.4 (2026-04-21)** — Phase 3 进入 implementation：阶段 0 审计（commit 571e810）+ 阶段 1 spike（commit d439a34）+ 阶段 2 简化 B.5（commit 9f1bfed）+ 阶段 3a opt-in gate（commit 3aae01a）。G1 闭合（SIGKILL-before-checkpoint 时 compute 找不到 tree root），R10 在 lazy 模式下自然不触发。`ORIOLEDB_LAZY_RECOVERY=1` 做 opt-in 开关。下一步需过单线程 crash 矩阵才切默认（阶段 3b）。遗留 G2（CRUD count=0）和 G3（concurrent crash SELECT assert）独立于 Phase 3。
+- **v1.5 (2026-04-22)** — 阶段 3b flip default（commit 06bb40b）：lazy 成默认，`ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1` 回退。基于 docs/P3_TEST_MATRIX.md 6-test × 2-mode 数据（zero regression, crash_ddl 绿, crash_concurrent strictly better）。Post-flip verify 与 3a matrix bit-for-bit 一致。清理用的 `max_prepared_transactions=10` default（commit 1c63691）附带落地。阶段 4 清理 signal-path 代码待稳定期。
