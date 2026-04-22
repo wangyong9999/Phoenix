@@ -102,6 +102,67 @@ end-of-buffer into garbage tuple headers. With G2-L2's CSN counter
 seed fix, the rewind loop no longer triggers post-restart, and the
 garbage read is avoided.
 
+### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **OPEN**
+
+**Symptom (surfaced 2026-04-22 after G2 L2 fix):** After
+`test_e2e_crash_mid_ckpt` (SIGKILL during CHECKPOINT on 1000-row
+table), count(*) and full-table seq-scan md5 both complete (count
+matches pre-crash 1000=1000), **but md5 diverges** because the
+seq scan returns 1000 tuples in a different content order than
+pre-crash. Index range scan (`WHERE id BETWEEN 496 AND 505`)
+**PANICs** with:
+
+```
+PANIC: error reading downlink 80010000/0 in relfile (5, 16476)
+DETAIL: Hikeys don't match.
+```
+
+**Mechanism:** OrioleDB's SPLIT operation emits a single WAL
+record (`orioledb_page_wal_split` → 2 block refs: left + right
+leaves). The subsequent **parent-internal-node downlink update**
+is a SEPARATE WAL record (`orioledb_page_wal_emit_fpi` at
+`insert.c:1198`, R22 path).
+
+Between those two records there is a crash-exposure window. Under
+SIGKILL, PageServer may hold the two new leaves but NOT the
+updated parent. Post-restart the tree descent reads stale parent
+downlinks pointing at a pre-split page's blkno whose on-disk
+content is now the left half only — hikey range mismatch between
+parent's expectation and child's actual hikey → PANIC at
+`pgxn/orioledb/src/btree/io.c:1936`.
+
+**Not the same as G2-L2.** G2-L2 was CSN-counter cold-start. G7
+is structural WAL atomicity: two related page updates not landing
+atomically when the process dies between them.
+
+**Impact:**
+- `test_e2e_crash_mid_ckpt` still blocks CI hard-required.
+- Any power loss / OOM kill / node eviction mid-CHECKPOINT in
+  production exposes this.
+- Clean shutdown (the `cargo neon endpoint stop` path in
+  `test_e2e_crud`) is unaffected — PG flushes WAL fully before
+  exit, so both records reach SafeKeeper atomically from the
+  consumer's LSN ordering.
+
+**Fix directions (none cheap):**
+1. **Single-record atomicity:** fold the parent-downlink-update
+   into the SPLIT WAL record as a third block ref. Requires
+   coordinating the parent page's in-memory state with the split
+   (locks) and a new redo path.
+2. **Idempotent completion marker:** add a post-SPLIT WAL record
+   "split finalised" that walingest/compute can use to detect
+   half-applied splits on restart and re-apply the parent
+   downlink from the child's hikey.
+3. **Reconciliation at read time:** detect hikey mismatch in the
+   downlink-reader and auto-fixup the parent in-memory (best-effort,
+   lossy if both pages are materialised from a half-applied state
+   in PageServer).
+
+Direction 1 is cleanest and aligns with Log-is-Data (the split
+is one event in the log, not two). Non-trivial to implement
+(touches split.c, page_wal.c, page_redo.c, and walingest's
+interpretation of SPLIT records).
+
 ### G4 — `test_e2e_crash_compressed` checkpointer assert **OPEN**
 
 **Symptom:** `TRAP: failed Assert("cur->extent.offset < extent.off")`
@@ -248,7 +309,7 @@ tracked separately).
 | Category | Count | Notes |
 |---|---|---|
 | ✅ Closed | 6 | G1, G2, G3, R11, R12, plus R13 superseded |
-| 🔴 Open (correctness) | 2 | G4 (compressed), G6 (env) |
+| 🔴 Open (correctness) | 3 | G7 (SPLIT+parent race), G4 (compressed), G6 (env) |
 | 🟡 Feature gap | 3 | G5, F2, F3 |
 | ⏸ Phase 4 cleanup | 4 | delete dead signal-path code |
-| ⏳ CI lifted to hard-required | G2 fix landed | flip step-level `continue-on-error` now safe |
+| ⏳ CI crash_mid_ckpt still at step-level `continue-on-error` | G7 | hold until split/parent atomicity fix |
