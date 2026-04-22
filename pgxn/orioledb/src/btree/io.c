@@ -1583,6 +1583,43 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 	memset(img, 0, O_PAGE_HEADER_SIZE);
 	((BTreePageHeader *) img)->o_header.checkpointNum = ondisk_page_header.checkpointNum;
 
+	/*
+	 * Neon stateless cold start: this page carries a `csn` persisted
+	 * before the crash/restart. Post-restart `TransamVariables->nextCommitSeqNo`
+	 * is seeded from the checkpoint control file and the walingest
+	 * summary, but neither source reliably covers every CSN the first
+	 * session allocated (inline splits, certain structural ops bump
+	 * the counter without emitting a record that the summary tracks).
+	 *
+	 * If `nextCommitSeqNo` lags the persisted page's csn, the scan
+	 * iterator's rewind check at `load_next_disk_leaf_page` triggers
+	 * `read_page_from_undo` against `downlink.csn` derived from the
+	 * stale counter — leaves get rewound to a state before the data
+	 * was inserted, and `SELECT count(*)` returns 0 (concrete
+	 * G2-layer-2 mechanism).
+	 *
+	 * Bump the counter monotonically here so any downstream
+	 * `pg_atomic_read_u64(&nextCommitSeqNo)` (including the `readCsn`
+	 * path in `try_copy_page`) sees a value that dominates every
+	 * already-persisted page.
+	 */
+	{
+		BTreePageHeader *hdr = (BTreePageHeader *) img;
+
+		if (COMMITSEQNO_IS_NORMAL(hdr->csn))
+		{
+			CommitSeqNo cur;
+
+			do {
+				cur = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
+				if (cur > hdr->csn)
+					break;
+			} while (!pg_atomic_compare_exchange_u64(
+						 &TRANSAM_VARIABLES->nextCommitSeqNo,
+						 &cur, hdr->csn + 1));
+		}
+	}
+
 	/* For eviction/page checkpoint number test */
 	store_read_page_checkpoint_stats(((BTreePageHeader *) img)->o_header.checkpointNum);
 

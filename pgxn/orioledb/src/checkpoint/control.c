@@ -286,12 +286,18 @@ StaticAssertDecl(sizeof(OrioleDBStatePacked) == ORIOLEDB_STATE_ENCODED_SIZE,
 void
 apply_orioledb_cold_start_summary(void)
 {
-	File		fd;
+	int			fd;
 	OrioleDBStatePacked packed;
 	int			nread;
 	OXid		current;
 
-	fd = PathNameOpenFile(ORIOLEDB_STATE_FILENAME, O_RDONLY | PG_BINARY);
+	/*
+	 * BasicOpenFile — not PathNameOpenFile — because this function is
+	 * called from checkpoint_shmem_init, which runs in postmaster
+	 * before InitFileAccess sets up the VFD cache. PathNameOpenFile
+	 * asserts `SizeVfdCache > 0` and traps if called too early.
+	 */
+	fd = BasicOpenFile(ORIOLEDB_STATE_FILENAME, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 	{
 		/*
@@ -302,9 +308,8 @@ apply_orioledb_cold_start_summary(void)
 		return;
 	}
 
-	nread = FileRead(fd, (char *) &packed, sizeof(packed), 0,
-					 WAIT_EVENT_SLRU_READ);
-	FileClose(fd);
+	nread = read(fd, (char *) &packed, sizeof(packed));
+	close(fd);
 
 	if (nread != sizeof(packed))
 	{

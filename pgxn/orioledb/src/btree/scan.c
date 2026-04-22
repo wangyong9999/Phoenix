@@ -225,6 +225,20 @@ load_first_historical_page(BTreeSeqScan *scan)
 		O_TUPLE_SET_NULL(hikey.tuple);
 	O_TUPLE_SET_NULL(lokey.tuple);
 
+	{
+		/*
+		 * Neon cold-start adjustment, same rationale as in
+		 * `load_next_disk_leaf_page`: bump the effective snapshot
+		 * target so we don't walk undo against a stale
+		 * `scan->oSnapshot.csn` captured before `nextCommitSeqNo`
+		 * was brought up to cover persisted page csns.
+		 */
+		CommitSeqNo cur = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
+
+		if (cur > scan->oSnapshot.csn)
+			scan->oSnapshot.csn = cur;
+	}
+
 	while (COMMITSEQNO_IS_NORMAL(header->csn) &&
 		   header->csn >= scan->oSnapshot.csn)
 	{
@@ -1073,9 +1087,33 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 								  downlink.downlink,
 								  &extent);
 	header = (BTreePageHeader *) scan->leafImg;
-	if (header->csn >= downlink.csn)
-		read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
-							downlink.csn, NULL, BTreeKeyNone, NULL);
+	{
+		/*
+		 * Neon cold-start adjustment: `downlink.csn` was sampled from
+		 * `imgReadCsn` when the parent was read, which in Neon mode
+		 * reflects `nextCommitSeqNo` at that instant. Post-stateless-restart
+		 * that counter may have been stale (default seed
+		 * `COMMITSEQNO_FIRST_NORMAL+1` when control file load is blocked
+		 * by `IsUnderPostmaster`), then monotonically bumped by
+		 * `read_page_from_disk` as persisted-page csns are observed. Use
+		 * the current (possibly bumped) counter as a floor on the rewind
+		 * target so we don't roll a just-loaded leaf back against a
+		 * counter value from before its csn was even known.
+		 *
+		 * Standalone OrioleDB: `nextCommitSeqNo` is authoritative from the
+		 * start, `cur` never exceeds `downlink.csn` within a scan epoch
+		 * by more than the expected monotonic growth, so the floor is
+		 * no stronger than the original check.
+		 */
+		CommitSeqNo rewind_target = downlink.csn;
+		CommitSeqNo cur = pg_atomic_read_u64(&TRANSAM_VARIABLES->nextCommitSeqNo);
+
+		if (cur > rewind_target)
+			rewind_target = cur;
+		if (header->csn >= rewind_target)
+			read_page_from_undo(scan->desc, scan->leafImg, header->undoLocation,
+								rewind_target, NULL, BTreeKeyNone, NULL);
+	}
 
 	STOPEVENT(STOPEVENT_SCAN_DISK_PAGE,
 			  btree_page_stopevent_params(scan->desc,

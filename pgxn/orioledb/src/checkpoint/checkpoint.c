@@ -332,7 +332,26 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 			checkpoint_state->xidRecQueue[i].oxid = InvalidOXid;
 
 		if (!get_checkpoint_control_data(&control))
+		{
+			/*
+			 * Neon stateless cold start: local control file missing, and
+			 * the Plan E PageServer fallback inside
+			 * get_checkpoint_control_data is gated by IsUnderPostmaster
+			 * (smgr operations aren't safe to run in postmaster context
+			 * during shmem init). Without the control file, xid_meta and
+			 * startupCommitSeqNo stay at defaults (FirstNormalTransactionId
+			 * / COMMITSEQNO_FIRST_NORMAL+1).
+			 *
+			 * The walingest-maintained summary (`global/orioledb.state`,
+			 * delivered via basebackup) is on local disk and can be read
+			 * with PathNameOpenFile here. Apply it as a cold-start seed so
+			 * post-restart scans don't see a stale `nextCommitSeqNo` and
+			 * trigger undo-rewind against pages whose `header->csn` is
+			 * higher (the concrete G2-layer-2 mechanism).
+			 */
+			apply_orioledb_cold_start_summary();
 			return;
+		}
 
 		checkpoint_state->controlIdentifier = control.controlIdentifier;
 		checkpoint_state->lastCheckpointNumber = control.lastCheckpointNumber;
