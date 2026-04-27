@@ -102,7 +102,7 @@ end-of-buffer into garbage tuple headers. With G2-L2's CSN counter
 seed fix, the rewind loop no longer triggers post-restart, and the
 garbage read is avoided.
 
-### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **FIX COMMITTED 247b43b — CI VERIFICATION PENDING**
+### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **PARTIAL FIX 247b43b — RESIDUAL RACE STILL HITS CI**
 
 **Symptom (surfaced 2026-04-22 after G2 L2 fix):** After
 `test_e2e_crash_mid_ckpt` (SIGKILL during CHECKPOINT on 1000-row
@@ -150,9 +150,52 @@ keeps today's atomicity profile via a 2-blkref legacy emit at the
 flag. Cascade is a separate Gap to track if it ever surfaces in
 practice; not a regression from pre-fix behaviour.
 
-**CI verification pending.** When `test_e2e_crash_mid_ckpt` step
-turns green on its own (without `continue-on-error`), G7 can be
-marked CLOSED and the step flipped to hard-required.
+**v1 verification result (2026-04-27, CI run 24974782474 + 24976388512).**
+Hard-required flip showed the same PANIC pattern is still
+reachable: `error reading downlink 0x80010000/0 in relfile (5,
+16476). Hikeys don't match.` count(*) returns 1000 (matches
+pre-crash) but md5 diverges and any tree-descent (e.g. index
+range scan, the diagnostic `WHERE name <> ... ORDER BY id LIMIT
+20` in the test script's tail) PANICs at io.c hikey check.
+
+**Why v1 is incomplete.** Direction A v1 defers the SPLIT WAL
+emit to iter 2 so SPLIT and parent-downlink-update reach
+SafeKeeper as one XLogInsert in the no-cascade case. But this
+*also* defers the leaf split's WAL durability: a SIGKILL between
+iter 1 (in-memory perform_page_split, MARK_DIRTY, no WAL) and
+iter 2 (R22 site emit) loses both records. Plan E may emit
+PRE-split FPIs for the dirty pages but cannot reconstruct the
+post-split layout. Parent stays at the last-checkpoint state,
+hence `chkpNum=1` stale downlink in the panic.
+
+Pre-fix had the symmetric problem one record narrower: SIGKILL
+between perform_page_split's emit and the R22 emit lost only
+parent update; leaf split itself was durable. So v1 is a partial
+improvement (root split + non-cascade no-race-window cases now
+atomic) but a regression in the SIGKILL-race window (leaf data
+also lost there).
+
+**Path to a real fix (chosen direction left to whoever picks
+this up).**
+
+A. **Add an idempotent reconciliation marker (Direction B).**
+   Keep pre-fix's perform_page_split SPLIT emit (durable leaf).
+   At iter 2, emit a small SPLIT_FINALIZE record in addition to
+   parent FPI. walingest tracks SPLIT records that have not yet
+   seen a matching SPLIT_FINALIZE; on materialization, if the
+   pair is incomplete, synthesize the parent downlink from the
+   child's hikey. Requires walingest changes.
+B. **Hold pages locked + in-memory state across both XLogInsert
+   calls (Direction A v2).** Make perform_page_split emit
+   immediately AND iter 2 emit a separate parent-only FPI; keep
+   left+right locked between them so Plan E can't race. Verify
+   no deadlock with concurrent reads.
+C. **Revert v1 entirely.** Returns to pre-fix behaviour
+   (PANIC-on-descent + md5 mismatch). Loses no-cascade
+   improvement but un-loses the leaf-data SIGKILL window.
+
+Tracked as T1.1 in the active task list. Local build infra (PG
+v17 + ICU) is needed to iterate without 15-min CI round-trips.
 
 ### G8 — MERGE + parent-downlink-delete race (G7-equivalent) **FIX COMMITTED 0910d1d — CI VERIFICATION PENDING**
 
@@ -336,7 +379,8 @@ tracked separately).
 | Category | Count | Notes |
 |---|---|---|
 | ✅ Closed | 6 | G1, G2, G3, R11, R12, plus R13 superseded |
-| ⏳ Fix committed, CI verification pending | 2 | G7 (247b43b, 3-blkref atomic SPLIT), G8 (0910d1d, atomic MERGE via wired-up orioledb_page_wal_merge) |
+| 🟠 Partial fix landed, residual still hits CI | 1 | G7 (247b43b — root + non-cascade no-race-window covered, SIGKILL race window still loses leaf+parent both) |
+| ⏳ Fix committed, CI verification pending | 1 | G8 (0910d1d, atomic MERGE via wired-up orioledb_page_wal_merge) |
 | 🔴 Open (correctness, lower-priority) | 2 | G4 (compressed), G6 (env) |
 | 🟡 Feature gap | 3 | G5, F2, F3 |
 | ⚠️ Latent (designed in Q5, not implemented) | 2 | undoLocation cold-start gap (Q5 §A.3), meta-page atomic counter cold-start gap (Q5 §B.1-5) |
