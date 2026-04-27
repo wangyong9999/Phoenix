@@ -8,6 +8,24 @@ EXTENSION = orioledb
 PGFILEDESC = "orioledb - orioledb transactional storage engine via TableAm"
 SHLIB_LINK += -lzstd -lcurl -lssl -lcrypto
 
+# macOS / Homebrew: brew installs zstd / openssl headers under
+# /opt/homebrew/opt/<pkg>/include rather than the system include path
+# the standard PGXS build assumes. Inject brew's prefixes so OrioleDB
+# finds <zstd.h> on macOS dev hosts. No-op on Linux (the brew check
+# short-circuits when /opt/homebrew/bin/brew is absent).
+ifneq (,$(wildcard /opt/homebrew/bin/brew))
+  ZSTD_PREFIX := $(shell /opt/homebrew/bin/brew --prefix zstd 2>/dev/null)
+  OPENSSL_PREFIX := $(shell /opt/homebrew/bin/brew --prefix openssl@3 2>/dev/null)
+  ifneq (,$(ZSTD_PREFIX))
+    PG_CPPFLAGS += -I$(ZSTD_PREFIX)/include
+    SHLIB_LINK += -L$(ZSTD_PREFIX)/lib
+  endif
+  ifneq (,$(OPENSSL_PREFIX))
+    PG_CPPFLAGS += -I$(OPENSSL_PREFIX)/include
+    SHLIB_LINK += -L$(OPENSSL_PREFIX)/lib
+  endif
+endif
+
 DATA_built = $(patsubst %_prod.sql,%.sql,$(wildcard sql/*_prod.sql))
 DATA = $(filter-out $(wildcard sql/*_*.sql) $(DATA_built), $(wildcard sql/*sql))
 
