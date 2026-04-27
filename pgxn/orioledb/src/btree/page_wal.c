@@ -552,22 +552,30 @@ orioledb_page_ensure_extent(BTreeDescr *desc, OInMemoryBlkno blkno)
 }
 
 /*
- * Emit SPLIT FPIs — two pages in a single WAL record.
+ * Emit SPLIT FPIs — 2 or 3 pages in a single WAL record.
  *
  * Block ref 0: left page (FPI, existing page — has extent)
  * Block ref 1: right page (FPI, new page — extent pre-allocated)
+ * Block ref 2: parent page (FPI, with new downlink) — only when
+ *              parent_blkno is valid (G7 atomic form)
  *
- * Both pages are fully reorganized by perform_page_split, so FPI
- * is the natural strategy (delta would be same size).
+ * Pages are fully reorganized so FPI is the natural strategy.
+ *
+ * The 3-blkref atomic form folds the SPLIT WAL and the parent's
+ * downlink-insert FPI into one XLogInsert. This closes the G7
+ * race window where a SIGKILL between the two records left
+ * PageServer with post-split children and a pre-split parent.
  */
 void
 orioledb_page_wal_split(BTreeDescr *desc,
 						OInMemoryBlkno left_blkno,
-						OInMemoryBlkno right_blkno)
+						OInMemoryBlkno right_blkno,
+						OInMemoryBlkno parent_blkno)
 {
 	Page		left_page, right_page;
 	RelFileLocator rlocator;
 	BlockNumber left_disk, right_disk;
+	bool		has_parent = OInMemoryBlknoIsValid(parent_blkno);
 
 	if (!orioledb_page_wal_enabled())
 		return;
@@ -581,14 +589,6 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	if (left_disk == InvalidBlockNumber || right_disk == InvalidBlockNumber)
 		return;
 
-	/*
-	 * SPLIT FPIs carry two block refs at {0, 1}. XLogRegisterBlock asserts
-	 * these must target distinct (rlocator, fork, block). If left and right
-	 * somehow share a disk blkno (e.g. first-ever sys-tree split where the
-	 * new page's extent slot collides with the existing page), splitting the
-	 * WAL into two single-block records keeps PageServer's reconstruction
-	 * path correct and sidesteps the assert. The cost is one extra record.
-	 */
 	left_page = O_GET_IN_MEMORY_PAGE(left_blkno);
 	right_page = O_GET_IN_MEMORY_PAGE(right_blkno);
 	orioledb_page_wal_rlocator(desc, &rlocator);
@@ -596,13 +596,61 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	/*
 	 * left_disk == right_disk should be impossible after G2 fix in
 	 * evictable_tree_init_meta preserves root's pre-allocated extent.
-	 * If we hit it, it means some new code path is clobbering
-	 * datafileLength. Assert hard to catch regressions loudly; the
-	 * prior R11 workaround (emit as two single-block records) silently
+	 * If we hit it, some new code path is clobbering datafileLength.
+	 * The prior R11 workaround (two single-block records) silently
 	 * lost data via PageServer last-writer-wins.
 	 */
 	Assert(left_disk != right_disk);
 
+	if (has_parent)
+	{
+		Page		parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
+		BlockNumber parent_disk;
+
+		parent_disk = orioledb_page_get_blkno(parent_blkno);
+
+		if (parent_disk == InvalidBlockNumber)
+		{
+			/*
+			 * Parent has no extent — should not happen for a parent
+			 * that already participates in the tree, but guard against
+			 * unexpected emit-time state by falling back to the 2-blkref
+			 * legacy form. The caller is responsible for emitting a
+			 * separate FPI for the parent (R22-style) in that case.
+			 */
+			has_parent = false;
+		}
+		else
+		{
+			/* Same distinct-blkno invariant as left/right */
+			Assert(parent_disk != left_disk);
+			Assert(parent_disk != right_disk);
+
+			{
+				char		left_ondisk[ORIOLEDB_BLCKSZ];
+				char		right_ondisk[ORIOLEDB_BLCKSZ];
+				char		parent_ondisk[ORIOLEDB_BLCKSZ];
+
+				build_ondisk_page_image(left_ondisk, left_page);
+				build_ondisk_page_image(right_ondisk, right_page);
+				build_ondisk_page_image(parent_ondisk, parent_page);
+				XLogBeginInsert();
+				XLogRegisterBlock(0, &rlocator, MAIN_FORKNUM, left_disk,
+								  left_ondisk,
+								  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+				XLogRegisterBlock(1, &rlocator, MAIN_FORKNUM, right_disk,
+								  right_ondisk,
+								  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+				XLogRegisterBlock(2, &rlocator, MAIN_FORKNUM, parent_disk,
+								  parent_ondisk,
+								  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
+				XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_SPLIT);
+				return;
+			}
+		}
+	}
+
+	/* Legacy 2-blkref form (root split + cascade fallback) */
 	{
 		char		left_ondisk[ORIOLEDB_BLCKSZ];
 		char		right_ondisk[ORIOLEDB_BLCKSZ];

@@ -455,6 +455,19 @@ perform_page_split(BTreeDescr *desc, OInMemoryBlkno blkno,
 	MARK_DIRTY(desc, blkno);
 	MARK_DIRTY(desc, new_blkno);
 
-	/* Page-level WAL: emit FPIs for both pages of the split */
-	orioledb_page_wal_split(desc, blkno, new_blkno);
+	/*
+	 * Page-level WAL emit deferred to o_btree_insert_split's caller
+	 * (G7 fix). Two cases:
+	 *  - non-root split: iter 2 (the parent's downlink-insert path)
+	 *    emits a single 3-blkref SPLIT(left, right, parent) record
+	 *    so the split and the parent update reach SafeKeeper as one
+	 *    XLogInsert. If iter 2 cascades (parent itself splits), the
+	 *    cascade entry point in o_btree_insert_split emits the
+	 *    deferred 2-blkref SPLIT in legacy form before starting the
+	 *    parent split.
+	 *  - root split: the caller emits the 3-blkref SPLIT after
+	 *    o_btree_finish_root_split_internal returns, so the new
+	 *    internal root reaches SafeKeeper atomically with the two
+	 *    halves.
+	 */
 }

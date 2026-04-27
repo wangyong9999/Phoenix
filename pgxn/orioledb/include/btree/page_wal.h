@@ -63,10 +63,23 @@ extern void orioledb_page_wal_leaf_update(BTreeDescr *desc,
 										  uint16 tuple_len,
 										  uint16 old_tuple_size);
 
-/* Emit SPLIT FPIs (left page + right page as multi-block record) */
+/*
+ * Emit SPLIT FPIs.
+ *
+ * If parent_blkno is OInvalidInMemoryBlkno, the record carries 2 block
+ * refs (left, right) — legacy form, used for the cascade fallback path
+ * where the parent's downlink update lands in a separate WAL record.
+ *
+ * If parent_blkno is valid, the record carries 3 block refs (left,
+ * right, parent) — atomic form, used in the no-cascade path so that
+ * SPLIT and the parent's downlink update reach SafeKeeper as a single
+ * unit. Closes G7 (mid-CHECKPOINT SIGKILL leaving PageServer with
+ * post-split children but a pre-split parent → hikey-mismatch PANIC).
+ */
 extern void orioledb_page_wal_split(BTreeDescr *desc,
 									OInMemoryBlkno left_blkno,
-									OInMemoryBlkno right_blkno);
+									OInMemoryBlkno right_blkno,
+									OInMemoryBlkno parent_blkno);
 
 /* Emit MERGE FPIs (left page + parent page) */
 extern void orioledb_page_wal_merge(BTreeDescr *desc,

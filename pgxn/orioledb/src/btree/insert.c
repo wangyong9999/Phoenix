@@ -57,6 +57,18 @@ typedef struct BTreeInsertStackItem
 	bool		replace;
 	/* is refind_page must be called */
 	bool		refind;
+	/*
+	 * G7: set when this iteration's perform_page_split deferred its
+	 * SPLIT WAL emit (non-root path). The next iteration emits a
+	 * 3-blkref SPLIT(left, right, parent) at the parent-insert site
+	 * (atomic, no-cascade) or a 2-blkref legacy SPLIT at the cascade
+	 * entry of o_btree_insert_split. Distinct from rightBlkno's
+	 * "valid" check: rightBlkno can also be set by the broken-split
+	 * fix path (o_btree_insert_stack_push_split_item) where the
+	 * original split already reached SafeKeeper in a prior process —
+	 * we must not re-emit in that case.
+	 */
+	bool		deferredSplitPending;
 } BTreeInsertStackItem;
 
 /* Fills BTreeInsertStackItem as a downlink of current incomplete split. */
@@ -247,9 +259,12 @@ o_btree_finish_root_split_internal(BTreeDescr *desc,
 	MARK_DIRTY(desc, left_blkno);
 	MARK_DIRTY(desc, desc->rootInfo.rootPageBlkno);
 
-	/* Page-level WAL: root split — emit FPIs for left (old root content) and new root */
+	/*
+	 * Pre-allocate left's extent so the caller can include it in the
+	 * combined 3-blkref SPLIT WAL emit. The actual XLogInsert is
+	 * deferred to o_btree_insert_split (G7 atomicity fix).
+	 */
 	orioledb_page_ensure_extent(desc, left_blkno);
-	orioledb_page_wal_split(desc, desc->rootInfo.rootPageBlkno, left_blkno);
 
 	O_GET_IN_MEMORY_PAGEDESC(insert_item->rightBlkno)->leftBlkno = left_blkno;
 	btree_split_mark_finished(insert_item->rightBlkno, false, true);
@@ -313,6 +328,12 @@ o_btree_fix_page_split(BTreeDescr *desc, OInMemoryBlkno left_blkno)
 	iitem.refind = false;
 	iitem.level = level + 1;
 	iitem.next = NULL;
+	/*
+	 * G7: this path fixes a pre-existing broken split — the original
+	 * SPLIT WAL was already emitted by the prior backend; do not
+	 * let the cascade fallback re-emit it.
+	 */
+	iitem.deferredSplitPending = false;
 
 	o_btree_split_fill_downlink_item(&iitem, left_blkno, true);
 	o_btree_insert_item(&iitem, PPOOL_RESERVE_FIND);
@@ -407,6 +428,13 @@ o_btree_insert_stack_push_split_item(BTreeInsertStackItem *insert_item,
 	new_item->replace = false;
 	new_item->level = insert_item->level + 1;
 	new_item->next = insert_item;
+	/*
+	 * G7: this stack item is fixing a pre-existing broken split — the
+	 * underlying SPLIT WAL was already emitted by the original
+	 * (possibly crashed) backend. Do not let the cascade fallback in
+	 * o_btree_insert_split try to re-emit it.
+	 */
+	new_item->deferredSplitPending = false;
 
 	o_btree_split_fill_downlink_item(new_item, left_blkno, true);
 
@@ -657,6 +685,12 @@ o_btree_insert_mark_split_finished_if_needed(BTreeInsertStackItem *insert_item)
 		btree_split_mark_finished(insert_item->rightBlkno, true, true);
 		btree_unregister_inprogress_split(insert_item->rightBlkno);
 		insert_item->rightBlkno = OInvalidInMemoryBlkno;
+		/*
+		 * Clearing rightBlkno also discards any deferred-split signal
+		 * that referenced it; reset the flag so a subsequent reuse of
+		 * this insert_item starts clean.
+		 */
+		insert_item->deferredSplitPending = false;
 	}
 }
 
@@ -706,6 +740,34 @@ o_btree_insert_split(BTreeInsertStackItem *insert_item,
 
 	START_CRIT_SECTION();
 
+	/*
+	 * G7 cascade fallback: if a previous iteration's o_btree_insert_split
+	 * left a deferred SPLIT WAL emit (deferredSplitPending set), the
+	 * parent that should have absorbed the new downlink atomically
+	 * itself needs to split, so we cannot emit the 3-blkref atomic form.
+	 * Emit the deferred SPLIT in 2-blkref legacy form here (matches
+	 * pre-G7 behaviour for cascade — atomicity gap remains for cascade
+	 * but no regression vs today). insert_item->rightBlkno will be
+	 * overwritten below with this iteration's right_blkno.
+	 *
+	 * deferredSplitPending (not just rightBlkno valid) is the gate:
+	 * rightBlkno may also be set by o_btree_insert_stack_push_split_item
+	 * for a pre-existing broken split whose original SPLIT WAL was
+	 * already emitted by the prior backend.
+	 */
+	if (insert_item->deferredSplitPending &&
+		OInMemoryBlknoIsValid(insert_item->rightBlkno))
+	{
+		OInMemoryBlkno deferred_right = insert_item->rightBlkno;
+		OInMemoryBlkno deferred_left =
+			O_GET_IN_MEMORY_PAGEDESC(deferred_right)->leftBlkno;
+
+		if (OInMemoryBlknoIsValid(deferred_left))
+			orioledb_page_wal_split(desc, deferred_left, deferred_right,
+									OInvalidInMemoryBlkno);
+		insert_item->deferredSplitPending = false;
+	}
+
 	if (blkno == desc->rootInfo.rootPageBlkno)
 		root_split_left_blkno = ppool_get_page(desc->ppool, reserve_kind);
 	right_blkno = ppool_get_page(desc->ppool, reserve_kind);
@@ -743,6 +805,25 @@ o_btree_insert_split(BTreeInsertStackItem *insert_item,
 												   root_split_left_blkno,
 												   insert_item);
 
+		/*
+		 * G7: root-split atomic emit. Three pages reach a consistent
+		 * post-split shape only after finish_root_split_internal:
+		 *   - root_split_left_blkno: left half (original root content)
+		 *   - right_blkno: right half (new page allocated above)
+		 *   - desc->rootInfo.rootPageBlkno: the new internal root
+		 *     (rebuilt with two downlinks pointing at left + right)
+		 * Folding all three into a single 3-blkref SPLIT XLogInsert
+		 * makes the root promotion atomic from PageServer's view.
+		 * Without this, a SIGKILL between the previous (per-half)
+		 * SPLIT record and the new-root FPI could leave PageServer
+		 * with leaf-shaped halves and a still-leaf root → tree
+		 * descent breaks on next read.
+		 */
+		orioledb_page_wal_split(desc,
+								root_split_left_blkno,
+								right_blkno,
+								desc->rootInfo.rootPageBlkno);
+
 		next = true;
 		END_CRIT_SECTION();
 	}
@@ -760,7 +841,22 @@ o_btree_insert_split(BTreeInsertStackItem *insert_item,
 		next = false;
 		END_CRIT_SECTION();
 		insert_item->rightBlkno = right_blkno;
+		insert_item->deferredSplitPending = true;
 
+		/*
+		 * G7: non-root split — WAL emit deferred. Two paths take it
+		 * from here:
+		 *   (a) iter 2 (parent has space for the new downlink) emits
+		 *       a 3-blkref SPLIT(left, right, parent) at the R22 site
+		 *       in o_btree_insert_item_no_waiters/with_waiters — the
+		 *       atomic form that closes G7's no-cascade window.
+		 *   (b) iter 2 cascades because parent overflows; the cascade
+		 *       entry point at the top of o_btree_insert_split emits
+		 *       the deferred SPLIT in 2-blkref legacy form before
+		 *       starting parent's own split. Cascade keeps today's
+		 *       atomicity profile for now (v1 scope: no regression
+		 *       in cascade case; no fix for it either).
+		 */
 	}
 
 
@@ -1179,23 +1275,53 @@ o_btree_insert_item_no_waiters(BTreeInsertStackItem *insert_item,
 		else
 		{
 			/*
-			 * R22 fix — internal page downlink insertion after a child
-			 * split. Without emitting a WAL FPI here, PageServer's copy
-			 * of this parent stays pre-split; post-crash backends walking
-			 * from a stale parent skip the right-side children created
-			 * by the post-checkpoint splits. This is the (non-root) side
-			 * of the coverage; root split is handled by
-			 * `o_btree_finish_root_split_internal` via
-			 * `orioledb_page_wal_split`.
+			 * Internal page downlink insertion after a child split.
+			 *
+			 * G7: when this insert is the parent-side of a deferred
+			 * SPLIT (insert_item->rightBlkno valid, no cascade), emit
+			 * one 3-blkref SPLIT(left, right, parent=this page) so
+			 * the split and the parent update reach SafeKeeper as a
+			 * single XLogInsert. This closes the no-cascade window
+			 * where SIGKILL between the SPLIT record and the parent
+			 * FPI left PageServer with post-split children pointed
+			 * at by a pre-split parent → hikey-mismatch PANIC.
+			 *
+			 * Fall back to a standalone parent FPI (pre-G7 R22 form)
+			 * when the deferred split context is missing — covers
+			 * generic internal-page mutations not preceded by a
+			 * child split.
 			 */
+			if (insert_item->deferredSplitPending &&
+				OInMemoryBlknoIsValid(insert_item->rightBlkno))
 			{
-				static int fire_count = 0;
-				if (fire_count++ < 8)
-					elog(LOG, "R22 fire #%d: (%u,%u) blkno=%u level=%u",
-						 fire_count, desc->oids.datoid, desc->oids.relnode,
-						 blkno, PAGE_GET_LEVEL(p));
+				OInMemoryBlkno deferred_right = insert_item->rightBlkno;
+				OInMemoryBlkno deferred_left =
+					O_GET_IN_MEMORY_PAGEDESC(deferred_right)->leftBlkno;
+
+				if (OInMemoryBlknoIsValid(deferred_left))
+				{
+					orioledb_page_wal_split(desc, deferred_left,
+											deferred_right, blkno);
+					/*
+					 * Consumed: clear pending so subsequent iterations
+					 * on the same insert_item don't re-emit. Note that
+					 * rightBlkno itself is cleared by the regular
+					 * mark-split-finished flow below.
+					 */
+					insert_item->deferredSplitPending = false;
+				}
+				else
+				{
+					/* Defensive: fall back to legacy parent-only FPI. */
+					orioledb_page_wal_emit_fpi(desc, blkno,
+											   ORIOLEDB_XLOG_PAGE_IMAGE);
+				}
 			}
-			orioledb_page_wal_emit_fpi(desc, blkno, ORIOLEDB_XLOG_PAGE_IMAGE);
+			else
+			{
+				orioledb_page_wal_emit_fpi(desc, blkno,
+										   ORIOLEDB_XLOG_PAGE_IMAGE);
+			}
 		}
 
 		o_btree_insert_mark_split_finished_if_needed(insert_item);
@@ -1434,6 +1560,7 @@ o_btree_insert_tuple_to_leaf(OBTreeFindPageContext *context,
 	insert_item.replace = replace;
 	insert_item.rightBlkno = OInvalidInMemoryBlkno;
 	insert_item.refind = false;
+	insert_item.deferredSplitPending = false;
 
 	o_btree_insert_item(&insert_item, reserve_kind);
 
