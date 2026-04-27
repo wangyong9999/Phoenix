@@ -391,7 +391,9 @@ tracked separately).
 | ✅ Closed | 6 | G1, G2, G3, R11, R12, plus R13 superseded |
 | ✅ Fix verified on macOS production target | 2 | G7 (247b43b — 10/10 PASS local), G8 (0910d1d — local crash matrix passes) |
 | 🟡 Linux CI env-specific (informational) | 1 | G7 — Linux ubuntu runner timing exposes a race window not seen on macOS |
-| 🔴 Open (correctness, pre-existing pre-G7) | 3 | G3-family copy_fixed_key tuplen assert in seq scan post-restart for ddl + concurrent (verified as pre-G7 by bisect — restored 247b43b~1 OrioleDB src, same crash); G4 (compressed); G6 (env) |
+| 🔴 Open (correctness, pre-existing pre-G7) | 3 | G3-family copy_fixed_key tuplen assert in seq scan post-restart for ddl + concurrent at ROWS≥200 (verified pre-G7 via bisect — restored 247b43b~1 OrioleDB src, same crash); G4 (compressed); G6 (env) |
+| ⚪ Phase 4 cleanup, sequenced | 4 | T5.1+T5.2 done (compute_tools signal-path removed, -374 lines); T5.3 neutralized (apply_btree/sys_tree/tbl/_modify_record bodies → elog ERROR tombstones, 952e227); T5.3-final (full deletion of dispatch sites) and T5.4 (vendor PG signal-read branch) deferred until burn-in proves no callers fire |
+| ⚪ Architecture-clean latent gaps (deferred) | 2 | T7 undoLocation cold-start summary extension (Q5 §A.3 design); T9a meta-page atomic counter cold-start (Q5 §B). Both multi-file Rust+C+WAL format extensions; not affecting any current test |
 | 🟡 Feature gap | 3 | G5, F2, F3 |
 | ⚠️ Latent (designed in Q5, not implemented) | 2 | undoLocation cold-start gap (Q5 §A.3), meta-page atomic counter cold-start gap (Q5 §B.1-5) |
 | ⏸ Phase 4 cleanup | 4 | delete dead signal-path code |

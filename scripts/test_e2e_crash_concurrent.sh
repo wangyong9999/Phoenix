@@ -25,6 +25,13 @@
 
 set -euo pipefail
 
+# macOS: drop orphan PG SHM segments from previous SIGKILLed runs.
+# Source the helper if present (no-op on Linux).
+if [ -f "$(dirname "$0")/_macos_shm_cleanup.sh" ]; then
+    . "$(dirname "$0")/_macos_shm_cleanup.sh"
+    shm_cleanup_macos
+fi
+
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 export PATH="$PROJECT_DIR/pg_install/v17/bin:$PATH"
