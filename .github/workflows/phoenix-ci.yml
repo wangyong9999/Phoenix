@@ -202,11 +202,12 @@ jobs:
         # full native stack twice on every push would double the
         # job time for zero added coverage).
         #
-        # continue-on-error: true — currently blocked on G2 (see
-        # docs/GAPS.md): post-crash SELECT returns count=0 even for
-        # the pre-crash-checkpointed prefix. Same family as CRUD G2.
-        # Not caused by Phase 3 (reproduces in legacy mode too).
-        # When G2 closes, flip this back to a hard requirement.
+        # Diagnostic mode — keep continue-on-error so the build
+        # stays green while we iterate on G7's residual md5 mismatch
+        # (count is now correct post-fix, content still wrong for
+        # some rows; the script's tail emits per-row diagnostic on
+        # FAIL so each CI run gives us new signal). Flip to
+        # hard-required only after the residual is closed.
         id: e2e_crash
         continue-on-error: true
         run: bash scripts/test_e2e_crash_mid_ckpt.sh

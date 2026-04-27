@@ -249,6 +249,40 @@ if [ "$AFTER_SUM" != "$BEFORE_SUM" ]; then
     echo "      before: $BEFORE_SUM" >&2
     echo "      after:  $AFTER_SUM" >&2
     echo "      Log-is-Data claim violated: WAL replay produced a divergent row set." >&2
+    echo ""
+    echo "---- diagnostic: rows with mismatched content vs expected formula ----"
+    # The test inserts:
+    #   id 1..ROWS         => name='clean_<id>',       value=id*2.3
+    #   id ROWS+1..2*ROWS  => name='dirty_<id-ROWS>',  value=(id-ROWS)*7.11
+    # Print up to 20 rows that don't match the formula so we can see what
+    # walreplay actually produced. Bound the query to keep CI log size sane.
+    run_psql <<SQL >&2 || true
+SELECT id, name, value::text AS got_value,
+       CASE
+         WHEN id <= $ROWS THEN 'clean_' || id
+         ELSE 'dirty_' || (id - $ROWS)
+       END AS expected_name,
+       CASE
+         WHEN id <= $ROWS THEN (id * 2.3)::numeric::text
+         ELSE ((id - $ROWS) * 7.11)::numeric::text
+       END AS expected_value
+FROM crash_verify
+WHERE name <> CASE WHEN id <= $ROWS THEN 'clean_' || id ELSE 'dirty_' || (id - $ROWS) END
+   OR value <> CASE WHEN id <= $ROWS THEN (id * 2.3)::numeric ELSE ((id - $ROWS) * 7.11)::numeric END
+ORDER BY id
+LIMIT 20;
+SQL
+    echo "---- diagnostic: distribution of mismatched ids ----"
+    run_psql <<SQL >&2 || true
+SELECT
+  count(*) FILTER (WHERE id <= $ROWS AND (name <> 'clean_' || id OR value <> (id * 2.3)::numeric)) AS clean_band_mismatched,
+  count(*) FILTER (WHERE id >  $ROWS AND (name <> 'dirty_' || (id - $ROWS) OR value <> ((id - $ROWS) * 7.11)::numeric)) AS dirty_band_mismatched,
+  min(id) FILTER (WHERE name <> CASE WHEN id <= $ROWS THEN 'clean_' || id ELSE 'dirty_' || (id - $ROWS) END
+                      OR value <> CASE WHEN id <= $ROWS THEN (id * 2.3)::numeric ELSE ((id - $ROWS) * 7.11)::numeric END) AS first_bad_id,
+  max(id) FILTER (WHERE name <> CASE WHEN id <= $ROWS THEN 'clean_' || id ELSE 'dirty_' || (id - $ROWS) END
+                      OR value <> CASE WHEN id <= $ROWS THEN (id * 2.3)::numeric ELSE ((id - $ROWS) * 7.11)::numeric END) AS last_bad_id
+FROM crash_verify;
+SQL
     exit 1
 fi
 
