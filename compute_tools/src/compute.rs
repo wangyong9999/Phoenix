@@ -1673,8 +1673,7 @@ impl ComputeNode {
         // (xid/CSN mappings) must be rebuilt from WAL, so we set up
         // orioledb_recovery.signal to trigger selective replay.
         if matches!(spec.mode, ComputeMode::Primary) {
-            let pg_conf_path = pgdata_path.join("postgresql.conf");
-            let pg_conf_content = std::fs::read_to_string(&pg_conf_path)
+            let pg_conf_content = std::fs::read_to_string(pgdata_path.join("postgresql.conf"))
                 .unwrap_or_default();
             // Detect OrioleDB by checking for active config lines, not comments.
             // Match "orioledb" at start of line or after whitespace (GUC setting),
@@ -1780,127 +1779,21 @@ impl ComputeNode {
             //     (B.5, commit 9f1bfed) for per-tree rootDownlink
             //   - page-level FPI stream via GetPage for leaves
             //
-            // Signal-path (orioledb_recovery.signal + PG WAL replay of
-            // rmid=129) is the legacy fallback. Set
-            // ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1 to opt back into it
-            // while this transition settles. Phase 4 will delete the
-            // legacy path entirely.
-            //
-            // Empirical basis: docs/P3_TEST_MATRIX.md — six e2e crash
-            // tests run in both modes, zero regressions, crash_ddl
-            // PASS, crash_concurrent strictly better in lazy mode.
-            let legacy_signal = std::env::var("ORIOLEDB_LEGACY_SIGNAL_RECOVERY")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if legacy_signal {
-                tracing::error!(
-                    "OrioleDB recovery: legacy signal-path mode active \
-                     (ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1); \
-                     orioledb_recovery.signal + PG WAL replay will fire"
-                );
-            } else {
-                tracing::error!(
-                    "OrioleDB recovery: Phase 3 lazy mode (default); \
-                     cold-start via summary + GetPage, no signal-path"
-                );
-            }
-
-            if sync_lsn_present && legacy_signal {
-                // Copy SafeKeeper WAL files to pg_wal/ for replay
-                if let (Some(tid), Some(tlid)) = (spec.tenant_id, spec.timeline_id) {
-                    let neon_dir = pgdata_path
-                        .parent().and_then(|p| p.parent()).and_then(|p| p.parent())
-                        .unwrap_or(Path::new("."));
-                    let sk_wal_dir = neon_dir
-                        .join("safekeepers/sk1")
-                        .join(tid.to_string())
-                        .join(tlid.to_string());
-
-                    if let Err(e) = patch_and_copy_wal_files(pgdata_path, &sk_wal_dir) {
-                        warn!("OrioleDB recovery: WAL patch failed: {:#}", e);
-                    }
-                }
-
-                // Write orioledb_recovery.signal with the redo start LSN.
-                // Validate that sync_lsn is present and well-formed —
-                // writing an empty signal file would cause PG to enter
-                // recovery with an uninitialized redo LSN.
-                let written = write_orioledb_recovery_signal(pgdata_path, endpoint_dir)?;
-                let sync_lsn_trimmed = match written {
-                    None => {
-                        warn!(
-                            "OrioleDB recovery: sync LSN missing or invalid — \
-                             skipping WAL replay (first-start or corrupted)"
-                        );
-                        // Also write a diagnostic breadcrumb.
-                        use std::io::Write;
-                        let diag_path = endpoint_dir.join(".orioledb_recovery_diag.log");
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true).append(true).open(&diag_path)
-                        {
-                            let _ = writeln!(
-                                f,
-                                "[{}] signal_skipped: reason=sync_lsn_missing_or_invalid",
-                                chrono::Utc::now().to_rfc3339()
-                            );
-                        }
-                        String::new()
-                    }
-                    Some(lsn) => {
-                        let signal_path = pgdata_path.join("orioledb_recovery.signal");
-                        tracing::error!(
-                            "OrioleDB recovery: signal written to {} (lsn={})",
-                            signal_path.display(),
-                            lsn
-                        );
-                        // File-based diagnostic mirror (see above).
-                        {
-                            use std::io::Write;
-                            let diag_path = endpoint_dir.join(".orioledb_recovery_diag.log");
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&diag_path)
-                            {
-                                let _ = writeln!(
-                                    f,
-                                    "[{}] signal_written: path={} lsn={} size_ok={}",
-                                    chrono::Utc::now().to_rfc3339(),
-                                    signal_path.display(),
-                                    lsn,
-                                    signal_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
-                                );
-                            }
-                        }
-                        lsn
-                    }
-                };
-                if !sync_lsn_trimmed.is_empty() {
-
-                    // Phase 6.6.4c: force orioledb.skip_unmodified_trees=false
-                    // only for this stateless-restart boot, so the
-                    // end-of-recovery checkpoint emits fresh FPIs for every
-                    // user tree. Append to postgresql.conf — PG reads the
-                    // file each start, and normal subsequent checkpoints
-                    // (after orioledb_recovery.signal is consumed) also pay
-                    // the cost; the alternative of a boot-only override
-                    // requires a conf-file cleanup path that would be a new
-                    // source of bugs. The extra FPI volume on steady-state
-                    // checkpoints is bounded by user-data size and is
-                    // amortised by the fact that stateless computes are
-                    // short-lived anyway.
-                    let orioledb_conf_line =
-                        "\n# Phase 6.6.4c: force fresh FPI for all user trees on restart.\n\
-                         orioledb.skip_unmodified_trees = false\n";
-                    let mut conf = std::fs::OpenOptions::new()
-                        .append(true)
-                        .open(&pg_conf_path)?;
-                    use std::io::Write;
-                    conf.write_all(orioledb_conf_line.as_bytes())?;
-                    info!(
-                        "OrioleDB recovery: set skip_unmodified_trees=false in postgresql.conf \
-                         to force full-tree FPI emission on end-of-recovery checkpoint"
-                    );
-                }
-            }
+            // Phase 4 cleanup (T5.1): the legacy signal-path
+            // (`ORIOLEDB_LEGACY_SIGNAL_RECOVERY=1` → write
+            // orioledb_recovery.signal + copy SafeKeeper WAL into
+            // pg_wal + force end-of-recovery checkpoint via
+            // skip_unmodified_trees=false) is removed. Lazy mode
+            // (cold-start via OrioleDBColdStartSummary + GetPage)
+            // is now the only path. The escape-hatch env var is
+            // removed too — R10 is still open in legacy mode and
+            // any "rollback to legacy" attempt would re-encounter
+            // it, so the env var was a fiction. To revert, use
+            // git revert on this commit + the follow-up that
+            // deletes the helper functions and dispatch dead code.
+            tracing::info!(
+                "OrioleDB recovery: lazy cold-start (Phase 3 default, signal-path removed)"
+            );
         }
 
         if let Some(settings) = databricks_settings {
