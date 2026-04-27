@@ -13,7 +13,7 @@ concurrency:
 jobs:
   rust-check:
     name: Rust Check & Clippy
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -86,7 +86,7 @@ jobs:
 
   docs:
     name: Documentation Check
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -98,7 +98,7 @@ jobs:
 
   serverless-e2e:
     name: Serverless E2E (Plan E round-trip)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: rust-check
     # The baseline test_e2e.sh (clean stop/start round-trip) is now a
     # hard requirement — lazy cold-start is the default after Phase 3
