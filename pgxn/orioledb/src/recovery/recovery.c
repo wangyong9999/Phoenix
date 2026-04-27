@@ -1852,82 +1852,29 @@ recovery_insert_deleted_systree_callback(BTreeDescr *descr,
 }
 
 /*
- * Applies modify recovery record to the BTree.
+ * apply_btree_modify_record — Phase 4 cleanup (T5.3) neutralized.
+ *
+ * Reachable only via PG WAL replay during legacy signal-path
+ * recovery. T5.1 (commit 7bbd712) removed the env var that wrote
+ * orioledb_recovery.signal, and T5.2 (commit bbb1c5f) deleted the
+ * helpers that produced it. With no signal file, PG never enters
+ * recovery, so this function is provably dead in the lazy-default
+ * runtime. The body — which violates I2 by calling o_btree_modify
+ * with a tree-context-bound BTreeDescr — has been neutralized to
+ * an elog(ERROR) tombstone so any unexpected reach is loud, not
+ * silent. Full deletion is T5.3-final, after sufficient burn-in
+ * empirically confirms no callers fire.
  */
 bool
 apply_btree_modify_record(BTreeDescr *tree, RecoveryMsgType type,
 						  OTuple ptr, OXid oxid, CommitSeqNo csn)
 {
-	OBTreeModifyResult modifyResult;
-	BTreeModifyCallbackInfo callbackInfo = nullCallbackInfo;
-	bool		result;
-
-	callbackInfo.arg = &ptr;
-
-	if (IS_SYS_TREE_OIDS(tree->oids))
-	{
-		if (type == RecoveryMsgTypeInsert || type == RecoveryMsgTypeUpdate)
-		{
-			callbackInfo.modifyCallback = recovery_insert_systree_callback;
-			callbackInfo.modifyDeletedCallback = recovery_insert_deleted_systree_callback;
-		}
-	}
-	else if (tree->type == oIndexPrimary || tree->type == oIndexToast || tree->type == oIndexBridge)
-	{
-		if (type == RecoveryMsgTypeInsert || type == RecoveryMsgTypeUpdate)
-		{
-			callbackInfo.modifyCallback = recovery_insert_primary_callback;
-			callbackInfo.modifyDeletedCallback = recovery_insert_deleted_primary_callback;
-		}
-		else if (type == RecoveryMsgTypeDelete)
-		{
-			callbackInfo.modifyCallback = recovery_delete_primary_callback;
-			callbackInfo.modifyDeletedCallback = recovery_delete_deleted_primary_callback;
-		}
-	}
-	else
-	{
-		if (type == RecoveryMsgTypeInsert || type == RecoveryMsgTypeUpdate)
-		{
-			callbackInfo.modifyCallback = recovery_insert_overwrite_callback;
-			callbackInfo.modifyDeletedCallback = recovery_insert_deleted_overwrite_callback;
-		}
-		else if (type == RecoveryMsgTypeDelete)
-		{
-			callbackInfo.modifyCallback = recovery_delete_overwrite_callback;
-			callbackInfo.modifyDeletedCallback = recovery_delete_deleted_overwrite_callback;
-		}
-	}
-
-	switch (type)
-	{
-		case RecoveryMsgTypeInsert:
-			modifyResult = o_btree_modify(tree, BTreeOperationInsert,
-										  ptr, BTreeKeyLeafTuple,
-										  NULL, BTreeKeyNone,
-										  oxid, csn, RowLockUpdate,
-										  NULL, &callbackInfo);
-			result = modifyResult == OBTreeModifyResultInserted || modifyResult == OBTreeModifyResultUpdated;
-			break;
-		case RecoveryMsgTypeUpdate:
-			result = o_btree_modify(tree, BTreeOperationInsert,
-									ptr, BTreeKeyLeafTuple,
-									NULL, BTreeKeyNone,
-									oxid, csn, RowLockNoKeyUpdate,
-									NULL, &callbackInfo) == OBTreeModifyResultUpdated;
-			break;
-		case RecoveryMsgTypeDelete:
-			result = o_btree_modify(tree, BTreeOperationDelete,
-									ptr, BTreeKeyNonLeafKey,
-									NULL, BTreeKeyNone, oxid, csn, RowLockUpdate,
-									NULL, &callbackInfo) == OBTreeModifyResultDeleted;
-			break;
-		default:
-			Assert(false);
-			elog(ERROR, "Wrong recovery record type %d", type);
-	}
-
-	return result;
+	elog(ERROR,
+		 "apply_btree_modify_record reached after Phase 4 cleanup "
+		 "(T5.1+T5.2). The legacy signal-path was removed; recovery "
+		 "should not invoke this in lazy default mode. type=%d",
+		 (int) type);
+	return false;					/* unreachable */
 }
 
 void
@@ -4289,23 +4236,22 @@ worker_queue_flush(int worker_id)
 }
 
 /*
- * Applies recovery record to o_tables.
+ * apply_sys_tree_modify_record — Phase 4 cleanup (T5.3) neutralized.
  *
- * We do it by master process to avoid concurrent issues such as:
- *
- * Worker can not fetch table description because another worker does not
- * commit transaction yet.
+ * Wraps apply_btree_modify_record. Same dead-in-lazy-default
+ * argument. Tombstone for symmetry; the wrapped call would
+ * elog(ERROR) anyway.
  */
 static bool
 apply_sys_tree_modify_record(int sys_tree_num, uint16 type, OTuple tup,
 							 OXid oxid, CommitSeqNo csn)
 {
-	bool		result;
-
-	result = apply_btree_modify_record(get_sys_tree(sys_tree_num),
-									   type, tup, oxid, csn);
-
-	return result;
+	elog(ERROR,
+		 "apply_sys_tree_modify_record reached after Phase 4 cleanup "
+		 "(T5.1+T5.2). Lazy default does not enter PG recovery. "
+		 "sys_tree_num=%d type=%u",
+		 sys_tree_num, type);
+	return false;					/* unreachable */
 }
 
 /*

@@ -653,30 +653,27 @@ recovery_queue_process(shm_mq_handle *queue, int id)
 }
 
 /*
- * Apply the modify WAL record.
+ * apply_modify_record — Phase 4 cleanup (T5.3) neutralized.
+ *
+ * Worker-pool dispatch entry for modify (Insert/Update/Delete/
+ * BridgeErase) recovery messages. Reached only via the worker
+ * queue, which is fed only when PG enters legacy signal-path
+ * recovery — removed in T5.1+T5.2. Tombstone-elog so any
+ * unexpected reach is loud.
  */
 void
 apply_modify_record(OTableDescr *descr, OIndexDescr *id, uint16 type,
 					OTuple p)
 {
-	OXid		oxid;
-
-	oxid = get_current_oxid();
-
-	/*
-	 * Don't apply changes to secondary indices before TOAST is consisntent.
-	 * Otherwise, values of secondary indices on TOASTed fields can be
-	 * invalid.
-	 */
-	if (descr && toast_consistent)
-	{
-		/* Modify table */
-		apply_tbl_modify_record(descr, type, p, oxid, COMMITSEQNO_INPROGRESS);
-	}
-	else
-	{
-		apply_btree_modify_record(&id->desc, type, p, oxid, COMMITSEQNO_INPROGRESS);
-	}
+	(void) descr;
+	(void) id;
+	(void) p;
+	elog(ERROR,
+		 "apply_modify_record reached after Phase 4 cleanup "
+		 "(T5.1+T5.2). The recovery worker pool is fed only by "
+		 "legacy signal-path replay, which has been removed. "
+		 "type=%u",
+		 type);
 }
 
 /*
@@ -770,23 +767,15 @@ static void
 apply_tbl_modify_record(OTableDescr *descr, RecoveryMsgType type,
 						OTuple p, OXid oxid, CommitSeqNo csn)
 {
-	o_set_syscache_hooks();
-	switch (type)
-	{
-		case RecoveryMsgTypeInsert:
-			apply_tbl_insert(descr, p, oxid, csn);
-			break;
-		case RecoveryMsgTypeDelete:
-			apply_tbl_delete(descr, p, oxid, csn);
-			break;
-		case RecoveryMsgTypeUpdate:
-			apply_tbl_update(descr, p, oxid, csn);
-			break;
-		default:
-			Assert(false);
-			elog(ERROR, "Wrong primary index modify record type %d", type);
-	}
-	o_unset_syscache_hooks();
+	(void) descr;
+	(void) p;
+	(void) oxid;
+	(void) csn;
+	elog(ERROR,
+		 "apply_tbl_modify_record reached after Phase 4 cleanup "
+		 "(T5.1+T5.2). Recovery worker pool no longer fed in lazy "
+		 "default. type=%d",
+		 (int) type);
 }
 
 static void
