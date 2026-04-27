@@ -110,61 +110,84 @@ btree_try_merge_pages(BTreeDescr *desc,
 	page_locator_delete_item(parent, &right_loc);
 	MARK_DIRTY_EXTENDED(desc, parent_blkno, checkpoint);
 
-	/* Page-level WAL: parent page modified (downlink removed) */
-	orioledb_page_wal_emit_fpi(desc, parent_blkno, ORIOLEDB_XLOG_MERGE);
-
-	/* unlocks the parent page */
-	if (*merge_parent && is_page_too_sparse(desc, parent))
-	{
-		/*
-		 * We can try to merge thr parent page in the loop.  No undo is
-		 * required for non-leaf pages.
-		 */
-		if (!O_PAGE_IS(parent, RIGHTMOST))
-			copy_fixed_hikey(desc, parent_hikey, parent);
-		else
-			O_TUPLE_SET_NULL(parent_hikey->tuple);
-		unlock_page(parent_blkno);
-	}
-	else
-	{
-		/* no need to merge parent page */
-		unlock_page(parent_blkno);
-		parent_blkno = OInvalidInMemoryBlkno;
-		*merge_parent = false;
-	}
-
-	/* Make a page-level undo item if needed */
-	if (needsUndo)
-	{
-		undo_loc = make_merge_undo_image(desc, left, right, csn);
-		Assert(UndoLocationIsValid(undo_loc));
-
-		/*
-		 * Memory barrier between making undo image and setting the undo
-		 * location.
-		 */
-		pg_write_barrier();
-	}
-	else
-	{
-		undo_loc = InvalidUndoLocation;
-	}
-
 	/*
-	 * Merge the pages and remove rightlink to the right page.
-	 *
-	 * It contains the required memory barrier between making undo image and
-	 * setting the undo location.
+	 * Decide caller's next-iteration intent (whether the parent itself
+	 * is sparse enough to also try merging) and capture the hikey
+	 * payload while parent is still locked. The actual unlock + the
+	 * parent_blkno-invalidation + the *merge_parent flip are deferred
+	 * to after the unified MERGE WAL emit below — see the G7-style
+	 * atomicity fix at the orioledb_page_wal_merge() call site.
 	 */
-	merge_pages(desc, left_blkno, right, csn);
-	btree_page_update_max_key_len(desc, left);
-	MARK_DIRTY_EXTENDED(desc, left_blkno, checkpoint);
+	{
+		bool	parent_followup_merge = *merge_parent &&
+									   is_page_too_sparse(desc, parent);
 
-	/* Page-level WAL: left page modified (absorbed right page data) */
-	orioledb_page_wal_emit_fpi(desc, left_blkno, ORIOLEDB_XLOG_MERGE);
+		if (parent_followup_merge)
+		{
+			/* No undo is required for non-leaf pages */
+			if (!O_PAGE_IS(parent, RIGHTMOST))
+				copy_fixed_hikey(desc, parent_hikey, parent);
+			else
+				O_TUPLE_SET_NULL(parent_hikey->tuple);
+		}
 
-	/* the right page can not be found in B-Tree after this line */
+		/* Make a page-level undo item if needed */
+		if (needsUndo)
+		{
+			undo_loc = make_merge_undo_image(desc, left, right, csn);
+			Assert(UndoLocationIsValid(undo_loc));
+
+			/*
+			 * Memory barrier between making undo image and setting
+			 * the undo location.
+			 */
+			pg_write_barrier();
+		}
+		else
+		{
+			undo_loc = InvalidUndoLocation;
+		}
+
+		/*
+		 * Merge the pages and remove rightlink to the right page.
+		 *
+		 * It contains the required memory barrier between making
+		 * undo image and setting the undo location.
+		 */
+		merge_pages(desc, left_blkno, right, csn);
+		btree_page_update_max_key_len(desc, left);
+		MARK_DIRTY_EXTENDED(desc, left_blkno, checkpoint);
+
+		/*
+		 * Page-level WAL — atomic MERGE FPI covering both pages
+		 * in a single XLogInsert (G7-equivalent fix).
+		 *
+		 * Pre-fix: merge.c emitted two separate FPI records (one for
+		 * parent at the deleted-downlink moment, one for left after
+		 * merge_pages). A SIGKILL between the two left PageServer
+		 * with the parent's downlink already removed but right's
+		 * data not yet absorbed into left — equivalent in shape to
+		 * the SPLIT/parent-downlink race closed by G7.
+		 *
+		 * Post-fix: orioledb_page_wal_merge bundles (left, parent)
+		 * into one record. Both pages must be in their final
+		 * post-merge state at this point — left has absorbed
+		 * right via merge_pages, parent has had right's downlink
+		 * deleted. Parent is still locked here; both unlocks
+		 * happen below.
+		 */
+		orioledb_page_wal_merge(desc, left_blkno, parent_blkno);
+
+		/* the right page can not be found in B-Tree after this line */
+
+		/* Now safe to release the parent + commit the caller signal */
+		unlock_page(parent_blkno);
+		if (!parent_followup_merge)
+		{
+			parent_blkno = OInvalidInMemoryBlkno;
+			*merge_parent = false;
+		}
+	}
 
 	left_header->undoLocation = undo_loc;
 
