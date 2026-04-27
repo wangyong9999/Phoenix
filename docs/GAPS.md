@@ -102,7 +102,7 @@ end-of-buffer into garbage tuple headers. With G2-L2's CSN counter
 seed fix, the rewind loop no longer triggers post-restart, and the
 garbage read is avoided.
 
-### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **OPEN**
+### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **FIX COMMITTED 247b43b — CI VERIFICATION PENDING**
 
 **Symptom (surfaced 2026-04-22 after G2 L2 fix):** After
 `test_e2e_crash_mid_ckpt` (SIGKILL during CHECKPOINT on 1000-row
@@ -117,17 +117,17 @@ PANIC: error reading downlink 80010000/0 in relfile (5, 16476)
 DETAIL: Hikeys don't match.
 ```
 
-**Mechanism:** OrioleDB's SPLIT operation emits a single WAL
-record (`orioledb_page_wal_split` → 2 block refs: left + right
+**Mechanism (pre-fix):** OrioleDB's SPLIT operation emitted a single
+WAL record (`orioledb_page_wal_split` → 2 block refs: left + right
 leaves). The subsequent **parent-internal-node downlink update**
-is a SEPARATE WAL record (`orioledb_page_wal_emit_fpi` at
-`insert.c:1198`, R22 path).
+was a SEPARATE WAL record (`orioledb_page_wal_emit_fpi` at the
+R22 site in `insert.c`).
 
-Between those two records there is a crash-exposure window. Under
-SIGKILL, PageServer may hold the two new leaves but NOT the
-updated parent. Post-restart the tree descent reads stale parent
+Between those two records there was a crash-exposure window. Under
+SIGKILL, PageServer could hold the two new leaves but NOT the
+updated parent. Post-restart the tree descent read stale parent
 downlinks pointing at a pre-split page's blkno whose on-disk
-content is now the left half only — hikey range mismatch between
+content was now the left half only — hikey range mismatch between
 parent's expectation and child's actual hikey → PANIC at
 `pgxn/orioledb/src/btree/io.c:1936`.
 
@@ -135,33 +135,60 @@ parent's expectation and child's actual hikey → PANIC at
 is structural WAL atomicity: two related page updates not landing
 atomically when the process dies between them.
 
-**Impact:**
-- `test_e2e_crash_mid_ckpt` still blocks CI hard-required.
-- Any power loss / OOM kill / node eviction mid-CHECKPOINT in
-  production exposes this.
-- Clean shutdown (the `cargo neon endpoint stop` path in
-  `test_e2e_crud`) is unaffected — PG flushes WAL fully before
-  exit, so both records reach SafeKeeper atomically from the
-  consumer's LSN ordering.
+**Fix (commit 247b43b — Direction 1):** `orioledb_page_wal_split`
+now takes an optional `parent_blkno` and, when valid, emits a
+3-blkref FPI(left, right, parent) in a single XLogInsert.
+`perform_page_split` defers its WAL emit; the R22 site emits the
+combined record after the parent's downlink insert is in memory.
+Root split also lands as one 3-blkref record covering (left half,
+right half, new internal root) — previously two records inside
+the same CRIT but at distinct LSNs.
 
-**Fix directions (none cheap):**
-1. **Single-record atomicity:** fold the parent-downlink-update
-   into the SPLIT WAL record as a third block ref. Requires
-   coordinating the parent page's in-memory state with the split
-   (locks) and a new redo path.
-2. **Idempotent completion marker:** add a post-SPLIT WAL record
-   "split finalised" that walingest/compute can use to detect
-   half-applied splits on restart and re-apply the parent
-   downlink from the child's hikey.
-3. **Reconciliation at read time:** detect hikey mismatch in the
-   downlink-reader and auto-fixup the parent in-memory (best-effort,
-   lossy if both pages are materialised from a half-applied state
-   in PageServer).
+The cascade case (parent itself overflows on the new downlink)
+keeps today's atomicity profile via a 2-blkref legacy emit at the
+`o_btree_insert_split` entry, gated by a new `BTreeInsertStackItem.deferredSplitPending`
+flag. Cascade is a separate Gap to track if it ever surfaces in
+practice; not a regression from pre-fix behaviour.
 
-Direction 1 is cleanest and aligns with Log-is-Data (the split
-is one event in the log, not two). Non-trivial to implement
-(touches split.c, page_wal.c, page_redo.c, and walingest's
-interpretation of SPLIT records).
+**CI verification pending.** When `test_e2e_crash_mid_ckpt` step
+turns green on its own (without `continue-on-error`), G7 can be
+marked CLOSED and the step flipped to hard-required.
+
+### G8 — MERGE + parent-downlink-delete race (G7-equivalent) **FIX COMMITTED 0910d1d — CI VERIFICATION PENDING**
+
+**Symptom mechanism:** `btree_try_merge_pages` emitted two
+separate FPI records — parent at the deleted-downlink moment
+(after `page_locator_delete_item`) and left after `merge_pages`
+— across distinct XLogInsert calls inside the same critical
+section. SIGKILL between them left PageServer with parent's
+downlink to right already removed but left's data not yet
+absorbed: equivalent in shape to G7's race, applied to the
+delete/merge side.
+
+**Discovery path (2026-04-26 spike):** `pgxn/orioledb/src/btree/page_wal.c:678`
+defined `orioledb_page_wal_merge(desc, left_blkno, parent_blkno)`
+with the right 2-blkref shape, but the function had no callers
+— it appears to be an unfinished planned fix left behind.
+`merge.c:114` and `:165` instead emitted via two separate
+`orioledb_page_wal_emit_fpi` calls.
+
+**Fix (commit 0910d1d):** wire up `orioledb_page_wal_merge` as
+the single emit at the merge sequence's tail. Defer the parent
+unlock + invalidation + `*merge_parent` flip until after the
+unified emit. `left_header->undoLocation` / `csn` assignments
+remain post-emit (they are in-process undo metadata, intentionally
+not in the FPI).
+
+**Exposure (vs G7):** narrower than SPLIT — merges are
+DELETE/VACUUM-driven, not on the insert path, and not stressed
+by `test_e2e_crash_mid_ckpt` which is INSERT-only. The structural
+flaw was real and slightly worse than SPLIT (parent unlocked
+mid-CRIT before the left FPI), but observable only on
+DELETE-heavy workloads under SIGKILL.
+
+**CI verification pending.** Same gating as G7 — once the test
+matrix stabilises with both G7 and G8 fixes, the corresponding
+steps can be flipped to hard-required.
 
 ### G4 — `test_e2e_crash_compressed` checkpointer assert **OPEN**
 
@@ -309,7 +336,9 @@ tracked separately).
 | Category | Count | Notes |
 |---|---|---|
 | ✅ Closed | 6 | G1, G2, G3, R11, R12, plus R13 superseded |
-| 🔴 Open (correctness) | 3 | G7 (SPLIT+parent race), G4 (compressed), G6 (env) |
+| ⏳ Fix committed, CI verification pending | 2 | G7 (247b43b, 3-blkref atomic SPLIT), G8 (0910d1d, atomic MERGE via wired-up orioledb_page_wal_merge) |
+| 🔴 Open (correctness, lower-priority) | 2 | G4 (compressed), G6 (env) |
 | 🟡 Feature gap | 3 | G5, F2, F3 |
+| ⚠️ Latent (designed in Q5, not implemented) | 2 | undoLocation cold-start gap (Q5 §A.3), meta-page atomic counter cold-start gap (Q5 §B.1-5) |
 | ⏸ Phase 4 cleanup | 4 | delete dead signal-path code |
-| ⏳ CI crash_mid_ckpt still at step-level `continue-on-error` | G7 | hold until split/parent atomicity fix |
+| ⏳ CI crash_mid_ckpt still at step-level `continue-on-error` | G7 | flip to hard-required once G7 fix verifies green on its own |
