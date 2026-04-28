@@ -147,6 +147,58 @@ pub struct OrioleDbRecordDelta {
     pub max_csn_in_body: Option<u64>,
 }
 
+/// Per-tree atomic-counter snapshot reconstructed by walingest from
+/// the rmid=129 stream. Compute reads these at cold-start to seed
+/// `metaPage` fields for each tree (B.1–B.5 + T7 in Q5 vocabulary).
+///
+/// `tree_id` is the 64-bit hash of `(datoid, relnode, tree_type)`.
+/// Collision probability per tenant is negligible (< 2^-50 with
+/// ~10 trees per tenant).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerTreeCounters {
+    pub tree_id: u64,
+    /// `metaPage->ctid` — next ctid to allocate. T9a B.1.
+    pub ctid: u64,
+    /// `metaPage->bridge_ctid` — bridge index ctid. T9a B.2.
+    pub bridge_ctid: u64,
+    /// `metaPage->numFreeBlocks` — free-extent counter. T9a B.3.
+    pub num_free_blocks: u64,
+    /// `metaPage->leafPagesNum` — count of leaf pages. T9a B.4.
+    pub leaf_pages_num: u64,
+    /// `metaPage->datafileLength[chkp%2]` — per-checkpoint slot
+    /// extent watermark. T9a B.5.
+    pub datafile_length: [u64; 2],
+    /// Per-tree max `undoLocation` seen across UNDO_APPLY and
+    /// LEAF_INSERT/UPDATE/DELETE records that emit undo. T7.
+    pub undo_location: u64,
+}
+
+/// SPLIT record awaiting a matching `SPLIT_FINALIZE`. If walingest
+/// finishes ingesting up to the cold-start LSN with this entry still
+/// present, compute synthesizes the parent downlink update at apply
+/// time. Closes G7 without lock-holding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingSplit {
+    pub tree_id: u64,
+    pub left_blkno: u32,
+    pub right_blkno: u32,
+    /// LSN of the originating `ORIOLEDB_XLOG_SPLIT` record so the
+    /// pair can be matched and the child hikey re-fetched.
+    pub child_hikey_lsn: u64,
+    pub child_hikey_offset: u32,
+    pub _reserved: u32,
+}
+
+/// MERGE record awaiting a matching `MERGE_FINALIZE`. Same shape /
+/// purpose as `PendingSplit`, applied to the delete path. Closes G8.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingMerge {
+    pub tree_id: u64,
+    pub left_blkno: u32,
+    pub parent_blkno: u32,
+    pub merge_lsn: u64,
+}
+
 /// Per-timeline OrioleDB cold-start summary.
 ///
 /// Fields are intentionally minimal; additions require a
@@ -181,6 +233,21 @@ pub struct OrioleDBColdStartSummary {
     /// (see `vendor/postgres-v17/src/backend/access/transam/xlog.c:5669`).
     /// Added in packed format version 2.
     pub next_csn: u64,
+
+    /// Per-tree atomic counters (T7 + T9a B.1–B.5). Indexed by
+    /// `tree_id`; sparsely populated (only trees seen since the
+    /// most recent checkpoint appear here). Added in packed format
+    /// version 3.
+    pub per_tree: Vec<PerTreeCounters>,
+
+    /// SPLIT records awaiting matching `SPLIT_FINALIZE`. Compute
+    /// synthesizes parent state from these at apply time. G7 closure.
+    /// Added in packed format version 3.
+    pub pending_splits: Vec<PendingSplit>,
+
+    /// MERGE records awaiting matching `MERGE_FINALIZE`. G8 closure.
+    /// Added in packed format version 3.
+    pub pending_merges: Vec<PendingMerge>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,11 +271,47 @@ pub const ORIOLEDB_STATE_MAGIC: u32 = 0x534F524F;
 /// History:
 /// - v1 (40 bytes): next_oxid, last_pg_xid_seen, last_ingested_lsn_raw,
 ///   ingested_count. (Superseded — never shipped to production.)
-/// - v2 (48 bytes): v1 + next_csn. Current.
-pub const ORIOLEDB_STATE_VERSION: u32 = 2;
+/// - v2 (48 bytes): v1 + next_csn. Superseded.
+/// - v3 (variable): v2 + per-tree counters (ctid / bridge_ctid /
+///   numFreeBlocks / leafPagesNum / datafileLength[2] / undo_location)
+///   + pending_splits[] + pending_merges[] for SPLIT/MERGE
+///   reconciliation. See `docs/WALINGEST_SUMMARY_V3.md`. Current.
+pub const ORIOLEDB_STATE_VERSION: u32 = 3;
 
-/// Fixed wire-format size for the current `ORIOLEDB_STATE_VERSION`.
-pub const ORIOLEDB_STATE_ENCODED_SIZE: usize = 48;
+/// Size of the v2 fixed prefix (kept for back-compat decoding of
+/// older summary blobs). `ORIOLEDB_STATE_V3_HEADER_SIZE` adds a
+/// 16-byte counts header on top of this.
+pub const ORIOLEDB_STATE_V2_FIXED_SIZE: usize = 48;
+
+/// Size of v3's fixed header — v2 fixed prefix (48) + 16-byte counts
+/// header (`tree_count`, `pending_split_count`, `pending_merge_count`,
+/// `_reserved`). Variable-length per-tree / pending-pool sections
+/// follow this header.
+pub const ORIOLEDB_STATE_V3_HEADER_SIZE: usize = 64;
+
+/// Size of one `PerTreeCounters` slot in the variable section.
+/// 8 (tree_id) + 8 (ctid) + 8 (bridge_ctid) + 8 (num_free_blocks)
+/// + 8 (leaf_pages_num) + 16 (datafile_length[2]) + 8 (undo_location).
+pub const PER_TREE_COUNTERS_SIZE: usize = 64;
+
+/// Size of one `PendingSplit` slot. 8 (tree_id) + 4 (left_blkno)
+/// + 4 (right_blkno) + 8 (child_hikey_lsn) + 4 (child_hikey_offset)
+/// + 4 (_reserved).
+pub const PENDING_SPLIT_SIZE: usize = 32;
+
+/// Size of one `PendingMerge` slot. 8 (tree_id) + 4 (left_blkno)
+/// + 4 (parent_blkno) + 8 (merge_lsn).
+pub const PENDING_MERGE_SIZE: usize = 24;
+
+/// Sanity bound on dynamic-section element counts (per-tree,
+/// pending_splits, pending_merges). Prevents pathological summary
+/// blobs from exhausting memory at decode time.
+pub const ORIOLEDB_STATE_V3_MAX_ELEMENTS: u32 = 1 << 20;
+
+/// Legacy alias retained for any external callers; v3 encoding is
+/// variable-length so this constant only meaningfully describes v2.
+#[deprecated(note = "use ORIOLEDB_STATE_V2_FIXED_SIZE; v3 is variable-length")]
+pub const ORIOLEDB_STATE_ENCODED_SIZE: usize = ORIOLEDB_STATE_V2_FIXED_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
@@ -218,6 +321,9 @@ pub enum DecodeError {
     BadMagic(u32),
     /// Version is beyond what this reader understands.
     UnsupportedVersion(u32),
+    /// v3 dynamic-section element count exceeds the safety bound.
+    /// Indicates a corrupted or malicious summary blob.
+    TooManyElements(u32),
 }
 
 impl From<ContainerParseError> for IngestError {
@@ -457,45 +563,112 @@ impl OrioleDBColdStartSummary {
         self.ingest_delta(&delta, next_record_lsn_raw)
     }
 
-    /// Encode the summary into a fixed-layout, C-readable byte blob.
+    /// Encode the summary into a packed byte blob.
     ///
-    /// Wire format v2 (all little-endian, no padding beyond what's
-    /// spelled out; total `ORIOLEDB_STATE_ENCODED_SIZE = 48 bytes`):
+    /// Wire format v3 (all little-endian; v2 fixed prefix is a
+    /// strict subset so v2 decoders can read the first 48 bytes
+    /// transparently if they ignore the trailing dynamic section):
     ///
     /// ```text
     /// offset  size  field
+    /// ── v2 fixed prefix (48 bytes) ──
     /// 0       4     magic                  (= ORIOLEDB_STATE_MAGIC)
-    /// 4       4     version                (= ORIOLEDB_STATE_VERSION = 2)
+    /// 4       4     version                (= ORIOLEDB_STATE_VERSION = 3)
     /// 8       8     next_oxid              (u64)
     /// 16      4     last_pg_xid_seen       (u32)
     /// 20      4     _reserved (0)          (alignment pad for C)
     /// 24      8     last_ingested_lsn_raw  (u64)
     /// 32      8     ingested_count         (u64)
-    /// 40      8     next_csn               (u64)   <- NEW in v2
+    /// 40      8     next_csn               (u64)
+    /// ── v3 counts header (16 bytes) ──
+    /// 48      4     tree_count             (u32)
+    /// 52      4     pending_split_count    (u32)
+    /// 56      4     pending_merge_count    (u32)
+    /// 60      4     _reserved (0)
+    /// ── v3 dynamic section ──
+    /// 64                              tree_count × PER_TREE_COUNTERS_SIZE
+    /// 64 + tree_count*64              pending_split_count × PENDING_SPLIT_SIZE
+    /// 64 + …                          pending_merge_count × PENDING_MERGE_SIZE
     /// ```
     ///
     /// Consumers: pageserver basebackup ships these bytes as
     /// `global/orioledb.state`; the C-side reader in
     /// `pgxn/orioledb/src/checkpoint/control.c` reads them at shmem
     /// startup.
-    pub fn encode_packed(&self) -> [u8; ORIOLEDB_STATE_ENCODED_SIZE] {
-        let mut buf = [0u8; ORIOLEDB_STATE_ENCODED_SIZE];
+    pub fn encode_packed(&self) -> Vec<u8> {
+        let tree_count = self.per_tree.len();
+        let pending_split_count = self.pending_splits.len();
+        let pending_merge_count = self.pending_merges.len();
+        let total_size = ORIOLEDB_STATE_V3_HEADER_SIZE
+            + tree_count * PER_TREE_COUNTERS_SIZE
+            + pending_split_count * PENDING_SPLIT_SIZE
+            + pending_merge_count * PENDING_MERGE_SIZE;
+
+        let mut buf = vec![0u8; total_size];
+
+        // v2 fixed prefix
         buf[0..4].copy_from_slice(&ORIOLEDB_STATE_MAGIC.to_le_bytes());
         buf[4..8].copy_from_slice(&ORIOLEDB_STATE_VERSION.to_le_bytes());
         buf[8..16].copy_from_slice(&self.next_oxid.to_le_bytes());
         buf[16..20].copy_from_slice(&self.last_pg_xid_seen.to_le_bytes());
-        // bytes 20..24 are the reserved/padding slot, already zero.
+        // bytes 20..24 reserved/zero
         buf[24..32].copy_from_slice(&self.last_ingested_lsn_raw.to_le_bytes());
         buf[32..40].copy_from_slice(&self.ingested_count.to_le_bytes());
         buf[40..48].copy_from_slice(&self.next_csn.to_le_bytes());
+
+        // v3 counts header
+        buf[48..52].copy_from_slice(&(tree_count as u32).to_le_bytes());
+        buf[52..56].copy_from_slice(&(pending_split_count as u32).to_le_bytes());
+        buf[56..60].copy_from_slice(&(pending_merge_count as u32).to_le_bytes());
+        // bytes 60..64 reserved/zero
+
+        // per_tree[]
+        let mut cursor = ORIOLEDB_STATE_V3_HEADER_SIZE;
+        for entry in &self.per_tree {
+            buf[cursor..cursor + 8].copy_from_slice(&entry.tree_id.to_le_bytes());
+            buf[cursor + 8..cursor + 16].copy_from_slice(&entry.ctid.to_le_bytes());
+            buf[cursor + 16..cursor + 24].copy_from_slice(&entry.bridge_ctid.to_le_bytes());
+            buf[cursor + 24..cursor + 32].copy_from_slice(&entry.num_free_blocks.to_le_bytes());
+            buf[cursor + 32..cursor + 40].copy_from_slice(&entry.leaf_pages_num.to_le_bytes());
+            buf[cursor + 40..cursor + 48].copy_from_slice(&entry.datafile_length[0].to_le_bytes());
+            buf[cursor + 48..cursor + 56].copy_from_slice(&entry.datafile_length[1].to_le_bytes());
+            buf[cursor + 56..cursor + 64].copy_from_slice(&entry.undo_location.to_le_bytes());
+            cursor += PER_TREE_COUNTERS_SIZE;
+        }
+
+        // pending_splits[]
+        for entry in &self.pending_splits {
+            buf[cursor..cursor + 8].copy_from_slice(&entry.tree_id.to_le_bytes());
+            buf[cursor + 8..cursor + 12].copy_from_slice(&entry.left_blkno.to_le_bytes());
+            buf[cursor + 12..cursor + 16].copy_from_slice(&entry.right_blkno.to_le_bytes());
+            buf[cursor + 16..cursor + 24].copy_from_slice(&entry.child_hikey_lsn.to_le_bytes());
+            buf[cursor + 24..cursor + 28]
+                .copy_from_slice(&entry.child_hikey_offset.to_le_bytes());
+            buf[cursor + 28..cursor + 32].copy_from_slice(&entry._reserved.to_le_bytes());
+            cursor += PENDING_SPLIT_SIZE;
+        }
+
+        // pending_merges[]
+        for entry in &self.pending_merges {
+            buf[cursor..cursor + 8].copy_from_slice(&entry.tree_id.to_le_bytes());
+            buf[cursor + 8..cursor + 12].copy_from_slice(&entry.left_blkno.to_le_bytes());
+            buf[cursor + 12..cursor + 16].copy_from_slice(&entry.parent_blkno.to_le_bytes());
+            buf[cursor + 16..cursor + 24].copy_from_slice(&entry.merge_lsn.to_le_bytes());
+            cursor += PENDING_MERGE_SIZE;
+        }
+
+        debug_assert_eq!(cursor, total_size);
         buf
     }
 
-    /// Decode a packed blob produced by `encode_packed`. Validates
-    /// magic + version; unknown versions are rejected to keep the
-    /// C-side reader strict.
+    /// Decode a packed blob produced by `encode_packed`. Accepts both
+    /// v2 (legacy fixed-size) and v3 (variable-length) blobs; v2
+    /// decodes as v3 with empty `per_tree` / `pending_splits` /
+    /// `pending_merges`. This back-compat is intentional so a
+    /// PageServer running v3 code can read a v2 blob written by an
+    /// older walingest during rolling upgrade.
     pub fn decode_packed(bytes: &[u8]) -> Result<Self, DecodeError> {
-        if bytes.len() < ORIOLEDB_STATE_ENCODED_SIZE {
+        if bytes.len() < ORIOLEDB_STATE_V2_FIXED_SIZE {
             return Err(DecodeError::TooShort);
         }
         let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
@@ -503,15 +676,122 @@ impl OrioleDBColdStartSummary {
             return Err(DecodeError::BadMagic(magic));
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        if version != ORIOLEDB_STATE_VERSION {
-            return Err(DecodeError::UnsupportedVersion(version));
+        match version {
+            2 => {
+                // Legacy: just the v2 fixed prefix; dynamic section absent.
+                Ok(Self {
+                    next_oxid: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                    last_pg_xid_seen: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                    last_ingested_lsn_raw: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+                    ingested_count: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+                    next_csn: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+                    per_tree: Vec::new(),
+                    pending_splits: Vec::new(),
+                    pending_merges: Vec::new(),
+                })
+            }
+            3 => Self::decode_v3(bytes),
+            _ => Err(DecodeError::UnsupportedVersion(version)),
         }
+    }
+
+    fn decode_v3(bytes: &[u8]) -> Result<Self, DecodeError> {
+        if bytes.len() < ORIOLEDB_STATE_V3_HEADER_SIZE {
+            return Err(DecodeError::TooShort);
+        }
+        let tree_count = u32::from_le_bytes(bytes[48..52].try_into().unwrap());
+        let pending_split_count = u32::from_le_bytes(bytes[52..56].try_into().unwrap());
+        let pending_merge_count = u32::from_le_bytes(bytes[56..60].try_into().unwrap());
+
+        for &count in &[tree_count, pending_split_count, pending_merge_count] {
+            if count > ORIOLEDB_STATE_V3_MAX_ELEMENTS {
+                return Err(DecodeError::TooManyElements(count));
+            }
+        }
+
+        let expected_size = ORIOLEDB_STATE_V3_HEADER_SIZE
+            + (tree_count as usize) * PER_TREE_COUNTERS_SIZE
+            + (pending_split_count as usize) * PENDING_SPLIT_SIZE
+            + (pending_merge_count as usize) * PENDING_MERGE_SIZE;
+        if bytes.len() < expected_size {
+            return Err(DecodeError::TooShort);
+        }
+
+        let mut cursor = ORIOLEDB_STATE_V3_HEADER_SIZE;
+        let mut per_tree = Vec::with_capacity(tree_count as usize);
+        for _ in 0..tree_count {
+            per_tree.push(PerTreeCounters {
+                tree_id: u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()),
+                ctid: u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap()),
+                bridge_ctid: u64::from_le_bytes(
+                    bytes[cursor + 16..cursor + 24].try_into().unwrap(),
+                ),
+                num_free_blocks: u64::from_le_bytes(
+                    bytes[cursor + 24..cursor + 32].try_into().unwrap(),
+                ),
+                leaf_pages_num: u64::from_le_bytes(
+                    bytes[cursor + 32..cursor + 40].try_into().unwrap(),
+                ),
+                datafile_length: [
+                    u64::from_le_bytes(bytes[cursor + 40..cursor + 48].try_into().unwrap()),
+                    u64::from_le_bytes(bytes[cursor + 48..cursor + 56].try_into().unwrap()),
+                ],
+                undo_location: u64::from_le_bytes(
+                    bytes[cursor + 56..cursor + 64].try_into().unwrap(),
+                ),
+            });
+            cursor += PER_TREE_COUNTERS_SIZE;
+        }
+
+        let mut pending_splits = Vec::with_capacity(pending_split_count as usize);
+        for _ in 0..pending_split_count {
+            pending_splits.push(PendingSplit {
+                tree_id: u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()),
+                left_blkno: u32::from_le_bytes(
+                    bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                ),
+                right_blkno: u32::from_le_bytes(
+                    bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                ),
+                child_hikey_lsn: u64::from_le_bytes(
+                    bytes[cursor + 16..cursor + 24].try_into().unwrap(),
+                ),
+                child_hikey_offset: u32::from_le_bytes(
+                    bytes[cursor + 24..cursor + 28].try_into().unwrap(),
+                ),
+                _reserved: u32::from_le_bytes(
+                    bytes[cursor + 28..cursor + 32].try_into().unwrap(),
+                ),
+            });
+            cursor += PENDING_SPLIT_SIZE;
+        }
+
+        let mut pending_merges = Vec::with_capacity(pending_merge_count as usize);
+        for _ in 0..pending_merge_count {
+            pending_merges.push(PendingMerge {
+                tree_id: u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap()),
+                left_blkno: u32::from_le_bytes(
+                    bytes[cursor + 8..cursor + 12].try_into().unwrap(),
+                ),
+                parent_blkno: u32::from_le_bytes(
+                    bytes[cursor + 12..cursor + 16].try_into().unwrap(),
+                ),
+                merge_lsn: u64::from_le_bytes(
+                    bytes[cursor + 16..cursor + 24].try_into().unwrap(),
+                ),
+            });
+            cursor += PENDING_MERGE_SIZE;
+        }
+
         Ok(Self {
             next_oxid: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             last_pg_xid_seen: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
             last_ingested_lsn_raw: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
             ingested_count: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
             next_csn: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+            per_tree,
+            pending_splits,
+            pending_merges,
         })
     }
 }
@@ -888,7 +1168,9 @@ mod tests {
     fn packed_default_matches_expected_bytes() {
         let sum = OrioleDBColdStartSummary::default();
         let bytes = sum.encode_packed();
-        assert_eq!(bytes.len(), ORIOLEDB_STATE_ENCODED_SIZE);
+        // Default summary has empty dynamic section, so total size is
+        // exactly the v3 fixed header.
+        assert_eq!(bytes.len(), ORIOLEDB_STATE_V3_HEADER_SIZE);
         assert_eq!(
             u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
             ORIOLEDB_STATE_MAGIC
@@ -899,6 +1181,8 @@ mod tests {
         );
         // All data fields are zero in a default summary.
         assert_eq!(&bytes[8..40], &[0u8; 32]);
+        // v3 counts header — all zero since dynamic section is empty.
+        assert_eq!(&bytes[48..64], &[0u8; 16]);
     }
 
     #[test]
@@ -911,13 +1195,13 @@ mod tests {
         sum.next_csn = 0x9999_AAAA_BBBB_CCCC;
 
         let encoded = sum.encode_packed();
-        assert_eq!(encoded.len(), 48);
+        assert_eq!(encoded.len(), ORIOLEDB_STATE_V3_HEADER_SIZE);
         let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
         assert_eq!(decoded, sum);
     }
 
     #[test]
-    fn packed_v2_has_next_csn_at_offset_40() {
+    fn packed_v3_has_next_csn_at_offset_40() {
         let mut sum = OrioleDBColdStartSummary::default();
         sum.next_csn = 0x0123_4567_89AB_CDEF;
         let bytes = sum.encode_packed();
@@ -929,7 +1213,7 @@ mod tests {
 
     #[test]
     fn packed_decode_rejects_bad_magic() {
-        let mut bytes = [0u8; ORIOLEDB_STATE_ENCODED_SIZE];
+        let mut bytes = [0u8; ORIOLEDB_STATE_V3_HEADER_SIZE];
         bytes[0..4].copy_from_slice(&0xBAD0_BAD0_u32.to_le_bytes());
         assert!(matches!(
             OrioleDBColdStartSummary::decode_packed(&bytes),
@@ -958,6 +1242,181 @@ mod tests {
         ));
         assert!(matches!(
             OrioleDBColdStartSummary::decode_packed(&[0u8; 10]),
+            Err(DecodeError::TooShort)
+        ));
+    }
+
+    // --- v3 dynamic-section round-trip --------------------------------------
+
+    #[test]
+    fn packed_v3_with_per_tree_round_trips() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.next_oxid = 100;
+        sum.next_csn = 200;
+        sum.per_tree.push(PerTreeCounters {
+            tree_id: 0xAAAA_BBBB_CCCC_DDDD,
+            ctid: 0x1111_2222_3333_4444,
+            bridge_ctid: 0x0000_0000_0001_0001,
+            num_free_blocks: 500,
+            leaf_pages_num: 7,
+            datafile_length: [4096, 8192],
+            undo_location: 0x9999_8888_7777_6666,
+        });
+        sum.per_tree.push(PerTreeCounters {
+            tree_id: 0xFFFF_EEEE_DDDD_CCCC,
+            ctid: 9999,
+            ..Default::default()
+        });
+
+        let encoded = sum.encode_packed();
+        let expected_size =
+            ORIOLEDB_STATE_V3_HEADER_SIZE + 2 * PER_TREE_COUNTERS_SIZE;
+        assert_eq!(encoded.len(), expected_size);
+
+        let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
+        assert_eq!(decoded, sum);
+    }
+
+    #[test]
+    fn packed_v3_with_pending_splits_round_trips() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.pending_splits.push(PendingSplit {
+            tree_id: 0x1234_5678_9ABC_DEF0,
+            left_blkno: 100,
+            right_blkno: 101,
+            child_hikey_lsn: 0xDEAD_BEEF_CAFE_BABE,
+            child_hikey_offset: 42,
+            _reserved: 0,
+        });
+        sum.pending_splits.push(PendingSplit {
+            tree_id: 0x1234_5678_9ABC_DEF0,
+            left_blkno: 102,
+            right_blkno: 103,
+            child_hikey_lsn: 0xDEAD_BEEF_CAFE_BABF,
+            child_hikey_offset: 0,
+            _reserved: 0,
+        });
+
+        let encoded = sum.encode_packed();
+        let expected_size =
+            ORIOLEDB_STATE_V3_HEADER_SIZE + 2 * PENDING_SPLIT_SIZE;
+        assert_eq!(encoded.len(), expected_size);
+
+        let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
+        assert_eq!(decoded, sum);
+    }
+
+    #[test]
+    fn packed_v3_with_pending_merges_round_trips() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.pending_merges.push(PendingMerge {
+            tree_id: 0xCAFE_BABE_DEAD_BEEF,
+            left_blkno: 50,
+            parent_blkno: 1,
+            merge_lsn: 0x1234_5678_9ABC_DEF0,
+        });
+
+        let encoded = sum.encode_packed();
+        let expected_size = ORIOLEDB_STATE_V3_HEADER_SIZE + PENDING_MERGE_SIZE;
+        assert_eq!(encoded.len(), expected_size);
+
+        let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
+        assert_eq!(decoded, sum);
+    }
+
+    #[test]
+    fn packed_v3_with_all_sections_round_trips() {
+        let mut sum = OrioleDBColdStartSummary::default();
+        sum.next_oxid = 1_000_000;
+        sum.next_csn = 2_000_000;
+        sum.last_pg_xid_seen = 0x12345;
+        sum.last_ingested_lsn_raw = 0xABCD_EF01_2345_6789;
+        sum.ingested_count = 1024;
+
+        for i in 0..3 {
+            sum.per_tree.push(PerTreeCounters {
+                tree_id: 0x1000 + i as u64,
+                ctid: 100 * (i + 1) as u64,
+                bridge_ctid: 50 * (i + 1) as u64,
+                num_free_blocks: 200,
+                leaf_pages_num: 5 * (i + 1) as u64,
+                datafile_length: [1024 * (i + 1) as u64, 2048 * (i + 1) as u64],
+                undo_location: 0xFFFF + i as u64,
+            });
+        }
+        sum.pending_splits.push(PendingSplit {
+            tree_id: 0x1000,
+            left_blkno: 1,
+            right_blkno: 2,
+            child_hikey_lsn: 100,
+            child_hikey_offset: 0,
+            _reserved: 0,
+        });
+        sum.pending_merges.push(PendingMerge {
+            tree_id: 0x1001,
+            left_blkno: 3,
+            parent_blkno: 4,
+            merge_lsn: 200,
+        });
+
+        let encoded = sum.encode_packed();
+        let expected_size = ORIOLEDB_STATE_V3_HEADER_SIZE
+            + 3 * PER_TREE_COUNTERS_SIZE
+            + PENDING_SPLIT_SIZE
+            + PENDING_MERGE_SIZE;
+        assert_eq!(encoded.len(), expected_size);
+
+        let decoded = OrioleDBColdStartSummary::decode_packed(&encoded).unwrap();
+        assert_eq!(decoded, sum);
+    }
+
+    #[test]
+    fn packed_v3_decodes_legacy_v2_blob() {
+        // Hand-craft a v2 blob (48 bytes, version=2) and decode it with v3
+        // reader. Result should be a v3 summary with empty dynamic sections.
+        let mut bytes = vec![0u8; ORIOLEDB_STATE_V2_FIXED_SIZE];
+        bytes[0..4].copy_from_slice(&ORIOLEDB_STATE_MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        bytes[8..16].copy_from_slice(&0xAAAA_u64.to_le_bytes());
+        bytes[16..20].copy_from_slice(&0xBBBB_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0xCCCC_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&0xDDDD_u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0xEEEE_u64.to_le_bytes());
+
+        let decoded = OrioleDBColdStartSummary::decode_packed(&bytes).unwrap();
+        assert_eq!(decoded.next_oxid, 0xAAAA);
+        assert_eq!(decoded.last_pg_xid_seen, 0xBBBB);
+        assert_eq!(decoded.last_ingested_lsn_raw, 0xCCCC);
+        assert_eq!(decoded.ingested_count, 0xDDDD);
+        assert_eq!(decoded.next_csn, 0xEEEE);
+        assert!(decoded.per_tree.is_empty());
+        assert!(decoded.pending_splits.is_empty());
+        assert!(decoded.pending_merges.is_empty());
+    }
+
+    #[test]
+    fn packed_v3_rejects_too_many_elements() {
+        let mut bytes = vec![0u8; ORIOLEDB_STATE_V3_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&ORIOLEDB_STATE_MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        // Set tree_count past the safety bound.
+        let huge = ORIOLEDB_STATE_V3_MAX_ELEMENTS + 1;
+        bytes[48..52].copy_from_slice(&huge.to_le_bytes());
+        assert!(matches!(
+            OrioleDBColdStartSummary::decode_packed(&bytes),
+            Err(DecodeError::TooManyElements(_))
+        ));
+    }
+
+    #[test]
+    fn packed_v3_rejects_truncated_dynamic_section() {
+        // Header claims 5 trees but body is too short to contain them.
+        let mut bytes = vec![0u8; ORIOLEDB_STATE_V3_HEADER_SIZE];
+        bytes[0..4].copy_from_slice(&ORIOLEDB_STATE_MAGIC.to_le_bytes());
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        bytes[48..52].copy_from_slice(&5u32.to_le_bytes());
+        assert!(matches!(
+            OrioleDBColdStartSummary::decode_packed(&bytes),
             Err(DecodeError::TooShort)
         ));
     }
