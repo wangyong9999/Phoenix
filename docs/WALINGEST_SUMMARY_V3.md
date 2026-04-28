@@ -100,7 +100,7 @@ offset  size   field                                              version
 52      4      pending_split_count      (entries in pending_splits)
 56      4      pending_merge_count      (entries in pending_merges)
 60      4      _reserved                (alignment)
-64      tree_count * 56  per_tree[]
+64      tree_count * 64  per_tree[]                              (R1 confirmed)
         ┌─ tree id (u64): hash of (datoid, relnode, tree_type)
         ├─ ctid (u64)                                            T9a B.1
         ├─ bridge_ctid (u64)                                     T9a B.2

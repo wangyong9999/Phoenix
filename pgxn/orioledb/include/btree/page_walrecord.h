@@ -73,6 +73,15 @@
 /*      ORIOLEDB_XLOG_PAGE_IMAGE	0x81	   (existing — Plan E + R22 FPI) */
 #define ORIOLEDB_XLOG_ROOT_SPLIT	0x90	/* reserved, not emitted */
 #define ORIOLEDB_XLOG_UNDO_APPLY	0xA0	/* undo rollback (FPI) */
+/*
+ * v3 reconciliation markers (declared R2a; emit comes in R2b).
+ * Each FINALIZE record carries the parent FPI of a SPLIT/MERGE that
+ * was emitted earlier; walingest pairs them to close the G7/G8
+ * deferred-emit race window without holding cross-XLogInsert locks.
+ * See docs/WALINGEST_SUMMARY_V3.md.
+ */
+#define ORIOLEDB_XLOG_SPLIT_FINALIZE 0xB0	/* parent FPI paired with prior SPLIT */
+#define ORIOLEDB_XLOG_MERGE_FINALIZE 0xC0	/* parent FPI paired with prior MERGE */
 
 /*
  * xl_orioledb_leaf_insert — insert a tuple into a leaf page.
@@ -197,6 +206,8 @@ IsOrioleDBPageLevelWal(uint8 info)
 		case ORIOLEDB_XLOG_ROOT_SPLIT:
 		case ORIOLEDB_XLOG_UNDO_APPLY:
 		case ORIOLEDB_XLOG_PAGE_IMAGE:
+		case ORIOLEDB_XLOG_SPLIT_FINALIZE:
+		case ORIOLEDB_XLOG_MERGE_FINALIZE:
 			return true;
 		default:
 			return false;
@@ -216,7 +227,9 @@ IsOrioleDBPageFPI(uint8 info)
 		   masked == ORIOLEDB_XLOG_MERGE ||
 		   masked == ORIOLEDB_XLOG_PAGE_IMAGE ||
 		   masked == ORIOLEDB_XLOG_ROOT_SPLIT ||
-		   masked == ORIOLEDB_XLOG_UNDO_APPLY;
+		   masked == ORIOLEDB_XLOG_UNDO_APPLY ||
+		   masked == ORIOLEDB_XLOG_SPLIT_FINALIZE ||
+		   masked == ORIOLEDB_XLOG_MERGE_FINALIZE;
 }
 
 #endif							/* PAGE_WALRECORD_H */
