@@ -102,7 +102,7 @@ end-of-buffer into garbage tuple headers. With G2-L2's CSN counter
 seed fix, the rewind loop no longer triggers post-restart, and the
 garbage read is avoided.
 
-### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **FIX VERIFIED on macOS (247b43b) — Linux CI environment-specific**
+### G7 — SPLIT + parent-downlink-update race under mid-ckpt SIGKILL **FIX VERIFIED — macOS 10/10 PASS + Linux CI organic green (run 24979735940, 2026-04-27)**
 
 **Symptom (surfaced 2026-04-22 after G2 L2 fix):** After
 `test_e2e_crash_mid_ckpt` (SIGKILL during CHECKPOINT on 1000-row
@@ -157,16 +157,16 @@ pre/post checksum is byte-identical (`730c129b...`). G7's
 PANIC at io.c hikey-check is no longer reachable from the
 target workload on the production deployment platform.
 
-**Linux CI run 24974782474 + 24976388512** still reproduce the
-hikey PANIC. The difference is environment-specific timing:
-GitHub's ubuntu-latest runner schedules the
-CHECKPOINT-vs-SIGKILL race differently (likely the Plan E
-checkpointer makes more progress in 100ms before the kill,
-materializing pages into PageServer in a state the deferred
-WAL emit's window can race against). Since the production
-deployment target is macOS, CI Linux is now informational
-rather than gating; gh CLI on local macOS provides the
-authoritative verification path.
+**Linux CI follow-up (2026-04-27 run 24979735940):** the
+crash_mid_ckpt step now also passes organically on
+ubuntu-24.04 — the same fix that closes the macOS race
+window also closes the Linux CI window. Earlier runs
+(24974782474, 24976388512) reproduced the PANIC against
+intermediate iterations of the fix; the merged 247b43b
+shape is good on both platforms. Workflow step's
+`continue-on-error: true` was kept as a soft gate
+through the verification window and is now flipped to
+hard-required.
 
 **Why v1 is incomplete.** Direction A v1 defers the SPLIT WAL
 emit to iter 2 so SPLIT and parent-downlink-update reach
@@ -207,7 +207,7 @@ C. **Revert v1 entirely.** Returns to pre-fix behaviour
 Tracked as T1.1 in the active task list. Local build infra (PG
 v17 + ICU) is needed to iterate without 15-min CI round-trips.
 
-### G8 — MERGE + parent-downlink-delete race (G7-equivalent) **FIX COMMITTED 0910d1d — CI VERIFICATION PENDING**
+### G8 — MERGE + parent-downlink-delete race (G7-equivalent) **FIX VERIFIED — committed 0910d1d, Linux CI organic green via run 24979735940**
 
 **Symptom mechanism:** `btree_try_merge_pages` emitted two
 separate FPI records — parent at the deleted-downlink moment
@@ -239,9 +239,9 @@ flaw was real and slightly worse than SPLIT (parent unlocked
 mid-CRIT before the left FPI), but observable only on
 DELETE-heavy workloads under SIGKILL.
 
-**CI verification pending.** Same gating as G7 — once the test
-matrix stabilises with both G7 and G8 fixes, the corresponding
-steps can be flipped to hard-required.
+**CI verified (2026-04-27).** Run 24979735940 against G8 + G7
+together is organic green; crash_mid_ckpt step's
+`continue-on-error: true` is now flipped to hard-required.
 
 ### G4 — `test_e2e_crash_compressed` checkpointer assert **OPEN**
 
@@ -389,12 +389,11 @@ tracked separately).
 | Category | Count | Notes |
 |---|---|---|
 | ✅ Closed | 6 | G1, G2, G3, R11, R12, plus R13 superseded |
-| ✅ Fix verified on macOS production target | 2 | G7 (247b43b — 10/10 PASS local), G8 (0910d1d — local crash matrix passes) |
-| 🟡 Linux CI env-specific (informational) | 1 | G7 — Linux ubuntu runner timing exposes a race window not seen on macOS |
+| ✅ Fix verified on macOS + Linux CI | 2 | G7 (247b43b — macOS 10/10 PASS local, Linux CI run 24979735940 organic green), G8 (0910d1d — same run, hard-gate flipped) |
 | 🔴 Open (correctness, pre-existing pre-G7) | 3 | G3-family copy_fixed_key tuplen assert in seq scan post-restart for ddl + concurrent at ROWS≥200 (verified pre-G7 via bisect — restored 247b43b~1 OrioleDB src, same crash); G4 (compressed); G6 (env) |
 | ⚪ Phase 4 cleanup, sequenced | 4 | T5.1+T5.2 done (compute_tools signal-path removed, -374 lines); T5.3 neutralized (apply_btree/sys_tree/tbl/_modify_record bodies → elog ERROR tombstones, 952e227); T5.3-final (full deletion of dispatch sites) and T5.4 (vendor PG signal-read branch) deferred until burn-in proves no callers fire |
 | ⚪ Architecture-clean latent gaps (deferred) | 2 | T7 undoLocation cold-start summary extension (Q5 §A.3 design); T9a meta-page atomic counter cold-start (Q5 §B). Both multi-file Rust+C+WAL format extensions; not affecting any current test |
 | 🟡 Feature gap | 3 | G5, F2, F3 |
 | ⚠️ Latent (designed in Q5, not implemented) | 2 | undoLocation cold-start gap (Q5 §A.3), meta-page atomic counter cold-start gap (Q5 §B.1-5) |
 | ⏸ Phase 4 cleanup | 4 | delete dead signal-path code |
-| ⏳ CI crash_mid_ckpt still at step-level `continue-on-error` | G7 | flip to hard-required once G7 fix verifies green on its own |
+| ✅ CI crash_mid_ckpt hard-gated | G7+G8 | step's `continue-on-error: true` removed 2026-04-27 after run 24979735940 organic green |
