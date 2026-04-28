@@ -265,8 +265,17 @@ write_checkpoint_control(CheckpointControl *control)
  */
 #define ORIOLEDB_STATE_FILENAME		"global/orioledb.state"
 #define ORIOLEDB_STATE_MAGIC		0x534F524Fu		/* "OROS" */
-#define ORIOLEDB_STATE_VERSION		2u
-#define ORIOLEDB_STATE_ENCODED_SIZE	48
+/*
+ * Version tracks the Rust encoder in libs/wal_decoder/src/orioledb_state.rs.
+ * v3 (current) extends v2 with a counts header + variable-length
+ * per-tree / pending_splits / pending_merges sections AFTER the
+ * v2 fixed prefix. The fixed prefix layout below is unchanged from v2
+ * — v3 just appends. Apply paths for the dynamic section land in R3+
+ * (see docs/WALINGEST_SUMMARY_V3.md); this reader currently consumes
+ * only the v2 fixed prefix.
+ */
+#define ORIOLEDB_STATE_VERSION			3u
+#define ORIOLEDB_STATE_V2_FIXED_SIZE	48
 
 typedef struct
 {
@@ -280,8 +289,8 @@ typedef struct
 	uint64		next_csn;		/* v2 */
 } OrioleDBStatePacked;
 
-StaticAssertDecl(sizeof(OrioleDBStatePacked) == ORIOLEDB_STATE_ENCODED_SIZE,
-				 "OrioleDBStatePacked size must match the Rust encoder");
+StaticAssertDecl(sizeof(OrioleDBStatePacked) == ORIOLEDB_STATE_V2_FIXED_SIZE,
+				 "OrioleDBStatePacked size must match the Rust encoder's v2 fixed prefix");
 
 void
 apply_orioledb_cold_start_summary(void)
@@ -327,10 +336,16 @@ apply_orioledb_cold_start_summary(void)
 		return;
 	}
 
-	if (packed.version != ORIOLEDB_STATE_VERSION)
+	/*
+	 * Accept v2 (legacy) and v3 blobs. v3 has the same v2 fixed prefix
+	 * (read here) plus a trailing dynamic section consumed by R3+
+	 * apply paths. Future versions reject — fail-closed posture so a
+	 * blob written by a newer walingest doesn't get half-applied.
+	 */
+	if (packed.version != 2u && packed.version != ORIOLEDB_STATE_VERSION)
 	{
 		elog(LOG,
-			 "OrioleDB cold-start summary %s: unsupported version %u (expected %u)",
+			 "OrioleDB cold-start summary %s: unsupported version %u (expected 2 or %u)",
 			 ORIOLEDB_STATE_FILENAME, packed.version,
 			 ORIOLEDB_STATE_VERSION);
 		return;
