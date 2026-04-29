@@ -34,6 +34,7 @@
 #include "checkpoint/checkpoint.h"	/* CheckpointFileHeader */
 #include "storage/ipc.h"
 #include "utils/hsearch.h"
+#include "utils/page_pool.h"		/* CLEAR_AWAITING_SPLIT_WAL */
 
 /*
  * Build the on-disk image of an in-memory OrioleDB B-tree page into
@@ -578,7 +579,16 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	bool		has_parent = OInMemoryBlknoIsValid(parent_blkno);
 
 	if (!orioledb_page_wal_enabled())
+	{
+		/*
+		 * Non-Neon mode: no Plan E checkpoint emit pressure on these
+		 * pages, but the AWAITING flag was set unconditionally in
+		 * perform_page_split. Clear it so eviction isn't blocked.
+		 */
+		CLEAR_AWAITING_SPLIT_WAL(left_blkno);
+		CLEAR_AWAITING_SPLIT_WAL(right_blkno);
 		return;
+	}
 
 	/* Ensure right page has an extent */
 	orioledb_page_ensure_extent(desc, right_blkno);
@@ -587,7 +597,11 @@ orioledb_page_wal_split(BTreeDescr *desc,
 	right_disk = orioledb_page_get_blkno(right_blkno);
 
 	if (left_disk == InvalidBlockNumber || right_disk == InvalidBlockNumber)
+	{
+		CLEAR_AWAITING_SPLIT_WAL(left_blkno);
+		CLEAR_AWAITING_SPLIT_WAL(right_blkno);
 		return;
+	}
 
 	left_page = O_GET_IN_MEMORY_PAGE(left_blkno);
 	right_page = O_GET_IN_MEMORY_PAGE(right_blkno);
@@ -645,6 +659,16 @@ orioledb_page_wal_split(BTreeDescr *desc,
 								  parent_ondisk,
 								  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
 				XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_SPLIT);
+				/*
+				 * G7 race closure: SPLIT WAL now in walbuffer at allocated
+				 * LSN. Any subsequent Plan E FPI for these pages will land
+				 * at LSN > SPLIT (FIFO), so it's safe to let walk_page emit
+				 * them. Cleared without taking page locks — readers don't
+				 * inspect this flag; only walk_page does, and walk_page
+				 * locks before checking.
+				 */
+				CLEAR_AWAITING_SPLIT_WAL(left_blkno);
+				CLEAR_AWAITING_SPLIT_WAL(right_blkno);
 				return;
 			}
 		}
@@ -665,6 +689,8 @@ orioledb_page_wal_split(BTreeDescr *desc,
 						  right_ondisk,
 						  REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT);
 		XLogInsert(ORIOLEDB_RMGR_ID, ORIOLEDB_XLOG_SPLIT);
+		CLEAR_AWAITING_SPLIT_WAL(left_blkno);
+		CLEAR_AWAITING_SPLIT_WAL(right_blkno);
 	}
 }
 

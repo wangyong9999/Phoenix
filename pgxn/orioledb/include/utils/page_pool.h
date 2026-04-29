@@ -76,9 +76,20 @@ extern void ppool_free_page(OPagePool *pool, OInMemoryBlkno blkno, bool haveLock
 #define PAGE_DESC_FLAG_CONCURRENT_DIRTY	2	/* Second "dirty" flag used to
 											 * detect changes concurrent to
 											 * write operatorions */
+/*
+ * Set on a page from the moment perform_page_split / merge_pages mutates
+ * its in-memory content until the SPLIT/MERGE WAL XLogInsert returns. While
+ * set, walk_page (Plan E checkpoint emit + eviction) skips the page so an
+ * intermediate FPI cannot reach PageServer in front of the SPLIT/MERGE WAL.
+ * Lives in shmem (PageDesc), never serialized.
+ */
+#define PAGE_DESC_FLAG_AWAITING_SPLIT_WAL	4
 #define PAGE_DESC_FLAG_BOTH_DIRTY		(PAGE_DESC_FLAG_DIRTY | PAGE_DESC_FLAG_CONCURRENT_DIRTY)
 #define IS_DIRTY(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_DIRTY)
 #define IS_DIRTY_CONCURRENT(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_CONCURRENT_DIRTY)
+#define IS_AWAITING_SPLIT_WAL(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags & PAGE_DESC_FLAG_AWAITING_SPLIT_WAL)
+#define MARK_AWAITING_SPLIT_WAL(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags |= PAGE_DESC_FLAG_AWAITING_SPLIT_WAL)
+#define CLEAR_AWAITING_SPLIT_WAL(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags &= ~PAGE_DESC_FLAG_AWAITING_SPLIT_WAL)
 #define CLEAN_DIRTY_CONCURRENT(blkno) (O_GET_IN_MEMORY_PAGEDESC(blkno)->flags &= ~PAGE_DESC_FLAG_CONCURRENT_DIRTY)
 
 #define MARK_DIRTY_EXTENDED(desc, blkno, skipMeta) \

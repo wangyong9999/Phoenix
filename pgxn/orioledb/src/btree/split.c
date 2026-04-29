@@ -456,6 +456,19 @@ perform_page_split(BTreeDescr *desc, OInMemoryBlkno blkno,
 	MARK_DIRTY(desc, new_blkno);
 
 	/*
+	 * G7 race closure: hold off Plan E checkpoint and eviction on these
+	 * two pages until orioledb_page_wal_split has committed the SPLIT
+	 * record to walbuffer. Without this gate, a Plan E FPI for the
+	 * post-split right page (rightLink invalid in the old-rightmost
+	 * case) could reach SafeKeeper at an LSN where the parent has no
+	 * matching downlink update yet — cold-start descent then sees a
+	 * mismatch. walk_page_check_locked rejects pages with this flag.
+	 * Cleared inside orioledb_page_wal_split after XLogInsert returns.
+	 */
+	MARK_AWAITING_SPLIT_WAL(blkno);
+	MARK_AWAITING_SPLIT_WAL(new_blkno);
+
+	/*
 	 * Page-level WAL emit deferred to o_btree_insert_split's caller
 	 * (G7 fix). Two cases:
 	 *  - non-root split: iter 2 (the parent's downlink-insert path)

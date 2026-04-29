@@ -3125,6 +3125,22 @@ walk_page_check_locked(OInMemoryBlkno blkno, bool evict,
 		return WalkPageCheckFailed;
 	}
 
+	/*
+	 * G7 race closure: skip pages whose split mate has not yet emitted
+	 * its SPLIT WAL. Already-existing rightLink-valid check covers the
+	 * left page (rightLink points at right). This covers the right
+	 * page's old-rightmost case where rightLink is invalid. The flag
+	 * is cleared inside orioledb_page_wal_split after XLogInsert
+	 * returns, so the gate self-clears once the SPLIT record is in
+	 * walbuffer (FIFO guarantees any subsequent FPI from this page
+	 * reaches SafeKeeper at LSN > SPLIT's LSN).
+	 */
+	if (IS_AWAITING_SPLIT_WAL(blkno))
+	{
+		unlock_page(blkno);
+		return WalkPageCheckFailed;
+	}
+
 	return WalkPageCheckPassed;
 }
 
